@@ -22,7 +22,8 @@ This is a utility to convert A2R to WOZ. The supported version for A2R is versio
         <output.woz>
       
       Options:
-            --creator <CREATOR>              Set the creator (max 32 bytes. If less than 32 bytes, it will be padded with space) [default: A2RWOZ]
+            --creator <CREATOR>              Set the creator (max 32 bytes. If less than 32 bytes,
+                                             it will be padded with space) [default: A2RWOZ]
             --woz                            Set woz to true to dump tracks in TMAP
             --full-tracks                    Dump all tracks in 0.25 tracks increments
             --duplicate-quarter-tracks       Duplicate to quarter tracks
