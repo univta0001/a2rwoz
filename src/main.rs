@@ -638,7 +638,7 @@ fn find_loop(
                     let mut accuracy = segment
                         .iter()
                         .zip(compare_data.iter())
-                        .filter(|&(a, b)| (a == b))
+                        .filter(|&(a, b)| a == b)
                         .count();
                     accuracy = accuracy * ACCURACY_MULTIPLIER / compare_len;
 
