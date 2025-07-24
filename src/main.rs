@@ -26,6 +26,8 @@ const A2R_META_CHUNK: u32 = 0x4154454d;
 
 const LOOP_POINT_DELTA: usize = 64000;
 
+/// Maximum allowed mismatch ratio when comparing two tracks
+const MAX_MISMATCH_RATIO: f64 = 0.001; // 0.1 %
 const LABEL: &str = "A2RWOZ";
 
 type WozTrack = Vec<(bool, Vec<u8>, usize, u8, Vec<u8>)>;
@@ -501,32 +503,36 @@ fn analyze_flux_data(
     if let Some((start, end, accuracy)) =
         find_loop(&normalized_gap, location, capture_type, loop_point)
     {
-        let start = cumulative_gap[start];
-        let end = cumulative_gap[end];
+        if start < end && start < cumulative_gap.len() && end < cumulative_gap.len() {
+            let start = cumulative_gap[start];
+            let end = cumulative_gap[end];
 
-        let loop_flux_data = &decompressed[start..end];
-        a2_debug!(
-            debug,
-            "{label}: Track: {} Len: {} End: {} Accuracy: {}%",
-            location as f32 / 4.0,
-            loop_flux_data.len(),
-            end,
-            accuracy as f32 / 100.0
-        );
-
-        // Update the track if previous accuracy is not 100% or current accuracy is 100%
-        // 1. Prefer xtiming over timing capture type
-        // 2. If it is same capture-type, prefer higher accuracy
-        // 3. If accuracy = 100% is encountered, replaced with a newer one
-        let (_, _, old_accuracy, old_ct, _) = woz_track[location as usize];
-        if capture_type > old_ct || (capture_type == old_ct && accuracy >= old_accuracy) {
-            woz_track[location as usize] = (
-                true,
-                loop_flux_data.to_vec(),
-                accuracy,
-                capture_type,
-                flux_data.to_vec(),
+            let loop_flux_data = &decompressed[start..end];
+            a2_debug!(
+                debug,
+                "{label}: Track: {} Len: {} End: {} Accuracy: {}%",
+                location as f32 / 4.0,
+                loop_flux_data.len(),
+                end,
+                accuracy as f32 / 100.0
             );
+
+            // Update the track if previous accuracy is not 100% or current accuracy is 100%
+            // 1. Prefer xtiming over timing capture type
+            // 2. If it is same capture-type, prefer higher accuracy
+            // 3. If accuracy = 100% is encountered, replaced with a newer one
+            let (_, _, old_accuracy, old_ct, _) = woz_track[location as usize];
+            if capture_type > old_ct
+                || (capture_type == old_ct && accuracy >= old_accuracy && loop_flux_data.len() > 0)
+            {
+                woz_track[location as usize] = (
+                    true,
+                    loop_flux_data.to_vec(),
+                    accuracy,
+                    capture_type,
+                    flux_data.to_vec(),
+                );
+            }
         }
     } else if args.use_fft {
         let mut data: Vec<_> = decompressed.clone();
@@ -794,7 +800,7 @@ fn compare_track(track: &[u8], prev_track: &[u8], bit_timing: u8) -> bool {
     let compare_len = track.len().min(prev_track.len());
     let track = &track[0..compare_len];
     let prev_track = &prev_track[0..compare_len];
-    let count: usize = track
+    let mismatches: usize = track
         .iter()
         .zip(prev_track.iter())
         .map(|(&a, &b)| {
@@ -802,7 +808,7 @@ fn compare_track(track: &[u8], prev_track: &[u8], bit_timing: u8) -> bool {
                 as usize
         })
         .sum();
-    compare_len - count < 8
+    (mismatches as f64 / compare_len as f64) < MAX_MISMATCH_RATIO
 }
 
 fn _cross_correlation_sameness_ratio_fft(arr1: &[u8], arr2: &[u8]) -> f64 {
@@ -900,6 +906,11 @@ fn get_speed(data: &[u8], offset: usize) -> u8 {
             max_index = i;
         }
     }
+
+    if max_index == 0 {
+        max_index = 32
+    }
+
     max_index
 }
 
@@ -1294,7 +1305,7 @@ fn duplicate_tracks(index: usize, track_index: u8, map: &mut [u8]) {
         map[index + 1] = track_index;
     }
 
-    if index >= 8 && index + 1 < 160 {
+    if index >= 8 && index + 2 < 160 {
         map[index + 2] = track_index;
     }
 }
