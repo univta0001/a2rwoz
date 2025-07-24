@@ -277,6 +277,10 @@ fn process_strm_data(
         estimated_bit_timing
     );
 
+    if args.bit_timing == 0 {
+        args.bit_timing = estimated_bit_timing
+    }
+
     let bar = create_progress_bar((data.len() - *offset) as u64);
     let initial = *offset;
     while *offset < data.len() {
@@ -602,10 +606,9 @@ fn find_loop(
     }
 
     let cumulative_gap = get_cumulative_gap_array(normalized_gap);
-    let loop_point = loop_point as usize;
-    let loop_point = loop_point * 1020484 / 1000000;
+    let loop_point = (loop_point as u64 * 1020484 / 1000000) as usize;
     let lower = cumulative_gap
-        .binary_search(&(loop_point - LOOP_POINT_DELTA))
+        .binary_search(&(loop_point.saturating_sub(LOOP_POINT_DELTA) as usize))
         .unwrap_or_else(|idx| idx);
     let upper = cumulative_gap
         .binary_search(&(loop_point + LOOP_POINT_DELTA))
@@ -683,10 +686,6 @@ fn decrunch_stream(flux_record: &[u8]) -> Vec<u8> {
             v.extend(std::iter::repeat_n(0, count - 1));
             count = 0
         }
-    }
-    if count != 0 {
-        v.push(1);
-        v.extend(std::iter::repeat_n(0, count - 1));
     }
     v
 }
@@ -1169,14 +1168,18 @@ fn create_woz_file(
             if i < woz_tracks.len() && !woz_tracks[i].1.is_empty() {
                 tmap_map_data[i] = track_index;
                 if args.duplicate_quarter_tracks {
-                    duplicate_tracks(i, track_index, &mut tmap_map_data);
+                    if i % 4 == 0 {
+                        duplicate_tracks(i, track_index, &mut tmap_map_data);
+                    }
                 }
                 track_index += 1;
             }
         } else if i < woz_tracks.len() && !woz_tracks[i].1.is_empty() {
             flux_map_data[i] = track_index;
             if args.duplicate_quarter_tracks {
-                duplicate_tracks(i, track_index, &mut flux_map_data);
+                if i % 4 == 0 {
+                    duplicate_tracks(i, track_index, &mut flux_map_data);
+                }
             }
             track_index += 1;
             flux_enabled = true;
