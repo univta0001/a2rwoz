@@ -804,7 +804,7 @@ fn compare_track(track: &[u8], prev_track: &[u8], bit_timing: u8) -> bool {
         .iter()
         .zip(prev_track.iter())
         .map(|(&a, &b)| {
-            (normalized_value(a as usize, bit_timing) == normalized_value(b as usize, bit_timing))
+            (normalized_value(a as usize, bit_timing) != normalized_value(b as usize, bit_timing))
                 as usize
         })
         .sum();
