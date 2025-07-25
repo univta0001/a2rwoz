@@ -448,7 +448,7 @@ fn process_flux_data(
         Vec::new()
     };
 
-    if !args.full_tracks && location % 4 != 0 && !tracks.contains(&location) {
+    if !args.full_tracks && !location.is_multiple_of(4) && !tracks.contains(&location) {
         *offset += length as usize;
         return;
     }
@@ -761,7 +761,8 @@ fn decrunch_stream_woz(flux_len: usize, flux_record: &[usize], bit_timing: u8) -
     v
 }
 
-fn crunch_stream(data: &[u8]) -> Vec<u8> {
+fn crunch_stream(data: &[u8], step: u8) -> Vec<u8> {
+    let step = step as usize;
     let mut result = Vec::new();
     let mut i = 0;
     while i < data.len() {
@@ -771,6 +772,7 @@ fn crunch_stream(data: &[u8]) -> Vec<u8> {
             i += 1;
             j += 1;
         }
+        j /= step;
         while j >= 255 {
             result.push(255);
             j -= 255;
@@ -1212,14 +1214,14 @@ fn create_woz_file(
         } else if args.woz {
             if i < woz_tracks.len() && !woz_tracks[i].flux_data.is_empty() {
                 tmap_map_data[i] = track_index;
-                if args.duplicate_quarter_tracks && i % 4 == 0 {
+                if args.duplicate_quarter_tracks && i.is_multiple_of(4) {
                     duplicate_tracks(i, track_index, &mut tmap_map_data);
                 }
                 track_index += 1;
             }
         } else if i < woz_tracks.len() && !woz_tracks[i].flux_data.is_empty() {
             flux_map_data[i] = track_index;
-            if args.duplicate_quarter_tracks && i % 4 == 0 {
+            if args.duplicate_quarter_tracks && i.is_multiple_of(4) {
                 duplicate_tracks(i, track_index, &mut flux_map_data);
             }
             track_index += 1;
@@ -1266,7 +1268,7 @@ fn create_woz_file(
             let tmap_data =
                 decrunch_stream_woz(flux_data.len(), &normalized_gap, bit_timing * step);
             let data = if flux_map_data[i] != 0xff {
-                &crunch_stream(flux_data)
+                &crunch_stream(flux_data, step)
             } else {
                 &crunch_stream_woz(&tmap_data)
             };
@@ -1311,7 +1313,7 @@ fn create_woz_file(
     contents.extend(&tmap_chunk);
     contents.extend(&trks_chunk);
 
-    if contents.len() % block_size != 0 {
+    if !contents.len().is_multiple_of(block_size) {
         let padding = block_size - contents.len() % block_size;
         contents.extend(std::iter::repeat_n(0, padding));
     }
