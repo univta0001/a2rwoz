@@ -30,7 +30,14 @@ const LOOP_POINT_DELTA: usize = 64000;
 const MAX_MISMATCH_RATIO: f64 = 0.001; // 0.1 %
 const LABEL: &str = "A2RWOZ";
 
-type WozTrack = Vec<(bool, Vec<u8>, usize, u8, Vec<u8>)>;
+#[derive(Default)]
+struct WozTrackEntry {
+    loop_found: bool,
+    flux_data: Vec<u8>,
+    loop_accuracy: usize,
+    capture_type: u8,
+    original_flux_data: Vec<u8>
+}
 
 fn parse_creator(s: &str) -> Result<String, String> {
     if s.len() > 32 {
@@ -257,10 +264,10 @@ fn process_strm_data(
     offset: &mut usize,
     capture: Capture,
     args: &mut Args,
-) -> WozTrack {
+) -> Vec<WozTrackEntry> {
     let mut woz_track = Vec::new();
     for _ in 0..160 {
-        woz_track.push((false, Vec::<u8>::new(), 0, 0, Vec::<u8>::new()))
+        woz_track.push(WozTrackEntry::default());
     }
 
     let label = match capture {
@@ -328,10 +335,10 @@ fn process_rwcp_slvd(
     args: &mut Args,
     hard_sector_count: u8,
     rwcp: bool,
-) -> WozTrack {
+) -> Vec<WozTrackEntry> {
     let mut woz_track = Vec::new();
     for _ in 0..160 {
-        woz_track.push((false, Vec::<u8>::new(), 0, 0, Vec::<u8>::new()))
+        woz_track.push(WozTrackEntry::default())
     }
 
     *offset += 16;
@@ -403,7 +410,7 @@ fn process_flux_data(
     data: &[u8],
     offset: &mut usize,
     length: u32,
-    woz_track: &mut WozTrack,
+    woz_track: &mut [WozTrackEntry],
     flux_info: (u8, u8, u32),
     capture: &Capture,
     args: &mut Args,
@@ -441,7 +448,7 @@ fn process_flux_data(
     }
 
     // If accuracy is 100% and if fast loop is enabled, skip the other same locations
-    if args.fast_loop && woz_track[location as usize].2 == 10000 {
+    if args.fast_loop && woz_track[location as usize].loop_accuracy == 10000 {
         *offset += length as usize;
         return;
     }
@@ -453,7 +460,7 @@ fn process_flux_data(
 
 fn analyze_flux_data(
     data: &[u8],
-    woz_track: &mut WozTrack,
+    woz_track: &mut [WozTrackEntry],
     flux_info: (u8, u8, u32),
     offset: usize,
     length: u32,
@@ -525,19 +532,20 @@ fn analyze_flux_data(
             // 1. Prefer xtiming over timing capture type
             // 2. If it is same capture-type, prefer higher accuracy
             // 3. If accuracy = 100% is encountered, replaced with a newer one
-            let (_, _, old_accuracy, old_ct, _) = woz_track[location as usize];
-            if capture_type > old_ct
-                || (capture_type == old_ct
-                    && accuracy >= old_accuracy
+            let old_woz_track = &woz_track[location as usize];
+            if capture_type > old_woz_track.capture_type
+                || (capture_type == old_woz_track.capture_type
+                    && accuracy >= old_woz_track.loop_accuracy
                     && !loop_flux_data.is_empty())
             {
-                woz_track[location as usize] = (
-                    true,
-                    loop_flux_data.to_vec(),
-                    accuracy,
+                let woz_entry = WozTrackEntry {
+                    loop_found: true,
+                    flux_data: loop_flux_data.to_vec(),
+                    loop_accuracy: accuracy,
                     capture_type,
-                    flux_data.to_vec(),
-                );
+                    original_flux_data: flux_data.to_vec()
+                };
+                woz_track[location as usize] = woz_entry;
             }
         }
     } else if args.use_fft {
@@ -558,8 +566,14 @@ fn analyze_flux_data(
             for &item in data.iter().take(end) {
                 loop_flux_data.push(item);
             }
-            woz_track[location as usize] =
-                (false, loop_flux_data, 0, capture_type, flux_data.to_vec());
+            let woz_entry = WozTrackEntry {
+                    loop_found: false,
+                    flux_data: loop_flux_data.to_vec(),
+                    loop_accuracy: 0,
+                    capture_type,
+                    original_flux_data: flux_data.to_vec()
+                };
+            woz_track[location as usize] = woz_entry;
         }
     } else {
         a2_debug!(
@@ -569,14 +583,15 @@ fn analyze_flux_data(
             location as f32 / 4.0,
             reset_color(true)
         );
-        if (args.enable_fallback || tracks.contains(&location)) && !woz_track[location as usize].0 {
-            woz_track[location as usize] = (
-                false,
-                (decompressed[0..loop_point as usize]).to_vec(),
-                0,
-                capture_type,
-                flux_data.to_vec(),
-            );
+        if (args.enable_fallback || tracks.contains(&location)) && !woz_track[location as usize].loop_found {
+            let woz_entry = WozTrackEntry {
+                    loop_found: false,
+                    flux_data: (decompressed[0..loop_point as usize]).to_vec(),
+                    loop_accuracy: 0,
+                    capture_type,
+                    original_flux_data: flux_data.to_vec()
+                };
+            woz_track[location as usize] = woz_entry;
         }
 
         if args.show_failed_loop {
@@ -621,7 +636,7 @@ fn find_loop(
 
     let mut result = None;
     for index in 1..OFFSET_LIMIT {
-        if index + SAMPLE_SIZE >= normalized_gap.len() {
+        if index + SAMPLE_SIZE > normalized_gap.len() {
             continue;
         }
 
@@ -637,7 +652,7 @@ fn find_loop(
 
         if !indices.is_empty() && indices.len() < MAX_ALLOWABLE_INDICES {
             for i in 0..indices.len() {
-                if index < indices[i] {
+                if indices[i] > 0 && index < indices[i] {
                     let segment = &normalized_gap[index..indices[i]];
 
                     if segment.is_empty() {
@@ -1070,7 +1085,7 @@ fn capitalize_first_letter(s: &str) -> String {
 }
 
 fn create_woz_file(
-    woz_tracks: &mut WozTrack,
+    woz_tracks: &mut [WozTrackEntry],
     woz_info: &Info,
     args: &mut Args,
 ) -> std::io::Result<()> {
@@ -1084,14 +1099,14 @@ fn create_woz_file(
 
     if args.show_unsolved_tracks {
         for (i, item) in woz_tracks.iter().enumerate().take(160) {
-            if !woz_tracks[i].1.is_empty() && woz_tracks[i].2 != 10000 {
+            if !woz_tracks[i].flux_data.is_empty() && woz_tracks[i].loop_accuracy != 10000 {
                 println!(
                     "{}LOOP{}: Track {:5} ({:3})   : {}% accurate",
                     green_color(false),
                     reset_color(false),
                     i as f32 / 4.0,
                     i,
-                    item.2 / 100
+                    item.loop_accuracy / 100
                 )
             }
         }
@@ -1142,10 +1157,10 @@ fn create_woz_file(
 
         if args.compare_tracks {
             let mut found = 0xff;
-            if i < woz_tracks.len() && !woz_tracks[i].1.is_empty() {
+            if i < woz_tracks.len() && !woz_tracks[i].flux_data.is_empty() {
                 for (index, &item) in processed_tracks.iter().enumerate() {
-                    let prev_track = &woz_tracks[item as usize].4;
-                    if compare_track(&woz_tracks[i].4, prev_track, args.bit_timing) {
+                    let prev_track = &woz_tracks[item as usize].original_flux_data;
+                    if compare_track(&woz_tracks[i].original_flux_data, prev_track, args.bit_timing) {
                         found = index as u8;
                         break;
                     }
@@ -1155,7 +1170,7 @@ fn create_woz_file(
                     found = processed_tracks.len() as u8;
                     processed_tracks.push(i as u8);
                 } else {
-                    woz_tracks[i].1.clear();
+                    woz_tracks[i].flux_data.clear();
                 }
             }
             if args.woz {
@@ -1165,14 +1180,14 @@ fn create_woz_file(
                 flux_enabled = true;
             }
         } else if args.woz {
-            if i < woz_tracks.len() && !woz_tracks[i].1.is_empty() {
+            if i < woz_tracks.len() && !woz_tracks[i].flux_data.is_empty() {
                 tmap_map_data[i] = track_index;
                 if args.duplicate_quarter_tracks && i % 4 == 0 {
                     duplicate_tracks(i, track_index, &mut tmap_map_data);
                 }
                 track_index += 1;
             }
-        } else if i < woz_tracks.len() && !woz_tracks[i].1.is_empty() {
+        } else if i < woz_tracks.len() && !woz_tracks[i].flux_data.is_empty() {
             flux_map_data[i] = track_index;
             if args.duplicate_quarter_tracks && i % 4 == 0 {
                 duplicate_tracks(i, track_index, &mut flux_map_data);
@@ -1212,8 +1227,8 @@ fn create_woz_file(
     let mut largest_flux_track = 0;
 
     for i in 0..160 {
-        if i < woz_tracks.len() && !woz_tracks[i].1.is_empty() {
-            let flux_data = &woz_tracks[i].1;
+        if i < woz_tracks.len() && !woz_tracks[i].flux_data.is_empty() {
+            let flux_data = &woz_tracks[i].flux_data;
             let gap = get_gap_array(flux_data);
             let bit_timing = args.bit_timing;
             let normalized_gap = get_normalized_gap_array(&gap, bit_timing);
