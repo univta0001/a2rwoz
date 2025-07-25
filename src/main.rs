@@ -1303,7 +1303,7 @@ fn create_woz_file(
     contents.extend(&tmap_chunk);
     contents.extend(&trks_chunk);
 
-    if contents.len() % block_size == 0 {
+    if contents.len() % block_size != 0 {
         let padding = block_size - contents.len() % block_size;
         contents.extend(std::iter::repeat_n(0, padding));
     }
