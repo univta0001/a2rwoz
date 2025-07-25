@@ -1261,7 +1261,12 @@ fn create_woz_file(
     for i in 0..160 {
         if i < woz_tracks.len() && !woz_tracks[i].flux_data.is_empty() {
             let flux_data = &woz_tracks[i].flux_data;
-            let step = 72 / args.resolution;
+            let mut step = 72 / args.resolution;
+
+            if step == 0 {
+                step = 1;
+            }
+
             let gap = get_gap_array(flux_data);
             let bit_timing = args.bit_timing;
             let normalized_gap = get_normalized_gap_array(&gap, bit_timing * step);
