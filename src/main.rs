@@ -389,7 +389,7 @@ fn process_rwcp_slvd(
             if rwcp {
                 index_signals[hard_sector_count as usize] as u32
             } else {
-                index_signals[0]
+                index_signals[0] as u32
             }
         };
 
