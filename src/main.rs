@@ -259,25 +259,39 @@ fn process_info(data: &[u8], offset: usize, info: &mut Info, a2r3: bool) {
     }
 }
 
-fn process_strm_data(
-    data: &[u8],
-    offset: &mut usize,
-    capture: Capture,
-    args: &mut Args,
-) -> Vec<WozTrackEntry> {
+fn get_label(capture: &Capture) -> &'static str {
+    match *capture {
+        Capture::Strm => "STRM",
+        Capture::Data => "DATA",
+        Capture::Rwcp => "RWCP",
+        Capture::Slvd => "SLVD",
+    }
+}
+
+fn process_flux_capture<F>(
+    data_input: (&[u8], &mut usize, &mut Args),
+    capture: &Capture,
+    initial_offset_advance: usize,
+    speed_offset_calc: impl Fn(usize) -> usize,
+    read_data_fn: F,
+    should_break: impl Fn(u8) -> bool,
+    hard_sector_count: Option<u8>,
+) -> Vec<WozTrackEntry>
+where
+    F: Fn(&[u8], usize, &Capture, Option<u8>) -> (u8, u8, u32, u32, usize),
+{
+    let (data, offset, args) = data_input;
     let mut woz_track = Vec::new();
     for _ in 0..160 {
         woz_track.push(WozTrackEntry::default());
     }
 
-    let label = match capture {
-        Capture::Strm => "STRM",
-        Capture::Data => "DATA",
-        Capture::Rwcp => "RWCP",
-        Capture::Slvd => "SLVD",
-    };
+    *offset += initial_offset_advance;
+
+    let label = get_label(capture);
     let debug = args.debug;
-    let estimated_bit_timing = get_speed(data, *offset + 10);
+
+    let estimated_bit_timing = get_speed(data, speed_offset_calc(*offset));
     a2_debug!(
         debug,
         "{label}: Estimated bit timing : {}",
@@ -290,30 +304,22 @@ fn process_strm_data(
 
     let bar = create_progress_bar((data.len() - *offset) as u64);
     let initial = *offset;
+
     while *offset < data.len() {
         bar.set_position((*offset - initial) as u64);
-        let location = data[*offset];
 
-        if location == 0xff {
+        let current_byte = data[*offset];
+        if should_break(current_byte) {
             break;
         }
+
+        let (location, capture_type, length, loop_point, bytes_read) =
+            read_data_fn(data, *offset, capture, hard_sector_count);
 
         let msg = format!("{}", location as f32 / 4.0);
         bar.set_message(msg);
 
-        let capture_type = data[*offset + 1];
-        let length = if capture == Capture::Strm {
-            read_a2r_u32(data, *offset + 2)
-        } else {
-            read_a2r_big_u32(data, *offset + 2)
-        };
-        let loop_point = if capture == Capture::Strm {
-            read_a2r_u32(data, *offset + 6)
-        } else {
-            read_a2r_big_u32(data, *offset + 6)
-        };
-
-        *offset += 10;
+        *offset += bytes_read;
 
         process_flux_data(
             data,
@@ -321,12 +327,46 @@ fn process_strm_data(
             length,
             &mut woz_track,
             (location, capture_type, loop_point),
-            &capture,
+            capture,
             args,
         );
     }
     bar.finish_and_clear();
     woz_track
+}
+
+fn process_strm_data(
+    data: &[u8],
+    offset: &mut usize,
+    capture: Capture,
+    args: &mut Args,
+) -> Vec<WozTrackEntry> {
+    let speed_offset_calc = |current_offset: usize| current_offset + 10;
+    let read_data_fn = |data: &[u8], current_offset: usize, capture: &Capture, _: Option<u8>| {
+        let location = data[current_offset];
+        let capture_type = data[current_offset + 1];
+        let length = if *capture == Capture::Strm {
+            read_a2r_u32(data, current_offset + 2)
+        } else {
+            read_a2r_big_u32(data, current_offset + 2)
+        };
+        let loop_point = if *capture == Capture::Strm {
+            read_a2r_u32(data, current_offset + 6)
+        } else {
+            read_a2r_big_u32(data, current_offset + 6)
+        };
+        (location, capture_type, length, loop_point, 10) // 10 bytes read for this header
+    };
+
+    process_flux_capture(
+        (data, offset, args),
+        &capture,
+        0, // No initial offset advance for STRM
+        speed_offset_calc,
+        read_data_fn,
+        |location| location == 0xff, // Break condition for STRM/DATA
+        None,
+    )
 }
 
 fn process_rwcp_slvd(
@@ -336,80 +376,56 @@ fn process_rwcp_slvd(
     hard_sector_count: u8,
     rwcp: bool,
 ) -> Vec<WozTrackEntry> {
-    let mut woz_track = Vec::new();
-    for _ in 0..160 {
-        woz_track.push(WozTrackEntry::default())
-    }
+    let capture_type_enum = if rwcp { Capture::Rwcp } else { Capture::Slvd };
 
-    *offset += 16;
+    let speed_offset_calc =
+        |current_offset: usize| current_offset + 9 + 4 * data[current_offset + 4] as usize;
 
-    let label = if rwcp { "RWCP" } else { "SLVD" };
-    let debug = args.debug;
-    let estimated_bit_timing = get_speed(data, *offset + 9 + 4 * data[*offset + 4] as usize);
-    a2_debug!(
-        debug,
-        "{label}: Estimated bit timing : {}",
-        estimated_bit_timing
-    );
+    let read_data_fn =
+        |data: &[u8], current_offset: usize, _capture: &Capture, hard_sector_count: Option<u8>| {
+            let capture_type = data[current_offset + 1];
+            let location =
+                (data[current_offset + 2] as usize + data[current_offset + 3] as usize * 256) as u8;
+            let index_signals_size = data[current_offset + 4] as usize;
 
-    let bar = create_progress_bar((data.len() - *offset) as u64);
-    let initial = *offset;
-    while *offset < data.len() {
-        bar.set_position((*offset - initial) as u64);
-        if data[*offset] == 0x58 {
-            break;
-        }
+            let mut bytes_read = 5; // location, capture_type, location (2 bytes), index_signals_size
 
-        let capture_type = data[*offset + 1];
-        let location = (data[*offset + 2] as usize + data[*offset + 3] as usize * 256) as u8;
-        let index_signals_size = data[*offset + 4] as usize;
-        let mut index_signals = vec![0_usize; index_signals_size];
-
-        let msg = format!("{}", location as f32 / 4.0);
-        bar.set_message(msg);
-
-        *offset += 5;
-
-        if !rwcp {
-            // Skip Mirror Distance Outward and Mirror Distance Inward
-            *offset += 7;
-        }
-
-        if index_signals_size > 0 {
-            for item in index_signals.iter_mut().take(index_signals_size) {
-                *item = read_a2r_u32(data, *offset) as usize;
-                *offset += 4;
+            // Skip Mirror Distance Outward and Mirror Distance Inward for SLVD
+            if !rwcp {
+                bytes_read += 7;
             }
-        }
 
-        let length = read_a2r_u32(data, *offset);
-        let loop_point = if index_signals_size == 0 {
-            length
-        } else {
-            if rwcp {
-                index_signals[hard_sector_count as usize] as u32
+            let mut index_signals = vec![0_usize; index_signals_size];
+            if index_signals_size > 0 {
+                for item in index_signals.iter_mut().take(index_signals_size) {
+                    *item = read_a2r_u32(data, current_offset + bytes_read) as usize;
+                    bytes_read += 4;
+                }
+            }
+
+            let length = read_a2r_u32(data, current_offset + bytes_read);
+            bytes_read += 4; // for length
+
+            let loop_point = if index_signals_size == 0 {
+                length
+            } else if rwcp {
+                index_signals[hard_sector_count.unwrap() as usize] as u32
             } else {
                 index_signals[0] as u32
-            }
+            };
+
+            (location, capture_type, length, loop_point, bytes_read)
         };
 
-        *offset += 4;
-
-        let capture = if rwcp { Capture::Rwcp } else { Capture::Slvd };
-
-        process_flux_data(
-            data,
-            offset,
-            length,
-            &mut woz_track,
-            (location, capture_type, loop_point),
-            &capture,
-            args,
-        );
-    }
-    bar.finish_and_clear();
-
-    woz_track
+    process_flux_capture(
+        (data, offset, args),
+        &capture_type_enum,
+        16, // Initial offset advance for RWCP/SLVD
+        speed_offset_calc,
+        read_data_fn,
+        |current_byte| current_byte == 0x58, // Break condition for RWCP/SLVD
+        Some(hard_sector_count),
+    )
 }
 
 fn process_flux_data(
@@ -430,7 +446,7 @@ fn process_flux_data(
         Vec::new()
     };
 
-    if !args.full_tracks && !location.is_multiple_of(4) && !tracks.contains(&location) {
+    if !args.full_tracks && location % 4 != 0 && !tracks.contains(&location) {
         *offset += length as usize;
         return;
     }
@@ -573,12 +589,12 @@ fn analyze_flux_data(
                 loop_flux_data.push(item);
             }
             let woz_entry = WozTrackEntry {
-                    loop_found: false,
-                    flux_data: loop_flux_data.to_vec(),
-                    loop_accuracy: 0,
-                    capture_type,
-                    original_flux_data: flux_data.to_vec()
-                };
+                loop_found: false,
+                flux_data: loop_flux_data.to_vec(),
+                loop_accuracy: 0,
+                capture_type,
+                original_flux_data: flux_data.to_vec(),
+            };
             woz_track[location as usize] = woz_entry;
         }
     } else {
@@ -589,14 +605,16 @@ fn analyze_flux_data(
             location as f32 / 4.0,
             reset_color(true)
         );
-        if (args.enable_fallback || tracks.contains(&location)) && !woz_track[location as usize].loop_found {
+        if (args.enable_fallback || tracks.contains(&location))
+            && !woz_track[location as usize].loop_found
+        {
             let woz_entry = WozTrackEntry {
-                    loop_found: false,
-                    flux_data: (decompressed[0..loop_point as usize]).to_vec(),
-                    loop_accuracy: 0,
-                    capture_type,
-                    original_flux_data: flux_data.to_vec()
-                };
+                loop_found: false,
+                flux_data: (decompressed[0..loop_point as usize]).to_vec(),
+                loop_accuracy: 0,
+                capture_type,
+                original_flux_data: flux_data.to_vec(),
+            };
             woz_track[location as usize] = woz_entry;
         }
 
@@ -1166,7 +1184,11 @@ fn create_woz_file(
             if i < woz_tracks.len() && !woz_tracks[i].flux_data.is_empty() {
                 for (index, &item) in processed_tracks.iter().enumerate() {
                     let prev_track = &woz_tracks[item as usize].original_flux_data;
-                    if compare_track(&woz_tracks[i].original_flux_data, prev_track, args.bit_timing) {
+                    if compare_track(
+                        &woz_tracks[i].original_flux_data,
+                        prev_track,
+                        args.bit_timing,
+                    ) {
                         found = index as u8;
                         break;
                     }
@@ -1285,7 +1307,7 @@ fn create_woz_file(
     contents.extend(&tmap_chunk);
     contents.extend(&trks_chunk);
 
-    if !contents.len().is_multiple_of(block_size) {
+    if contents.len() % block_size == 0 {
         let padding = block_size - contents.len() % block_size;
         contents.extend(std::iter::repeat_n(0, padding));
     }
