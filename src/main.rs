@@ -125,6 +125,9 @@ struct Args {
     #[arg(long)]
     debug: bool,
 
+    #[arg(long, hide = true, default_value_t = 72)]
+    resolution: u8,
+
     #[arg(index = 1, value_name = "input.a2r")]
     input: String,
 
@@ -374,6 +377,11 @@ fn process_rwcp_slvd(
 ) -> Vec<WozTrackEntry> {
     let capture_type_enum = if rwcp { Capture::Rwcp } else { Capture::Slvd };
 
+    let label = get_label(&capture_type_enum);
+    let debug = args.debug;
+    a2_debug!(debug, "{label}: Resolution : {}", data[*offset + 1]);
+    args.resolution = data[*offset + 1];
+
     let data_offset = 9 + 4 * data[*offset + 4] as usize;
     let read_data_fn =
         |data: &[u8], current_offset: usize, _capture: &Capture, hard_sector_count: Option<u8>| {
@@ -382,7 +390,7 @@ fn process_rwcp_slvd(
                 (data[current_offset + 2] as usize + data[current_offset + 3] as usize * 256) as u8;
             let index_signals_size = data[current_offset + 4] as usize;
 
-            let mut bytes_read = 5; // location, capture_type, location (2 bytes), index_signals_size
+            let mut bytes_read = 5;
 
             // Skip Mirror Distance Outward and Mirror Distance Inward for SLVD
             if !rwcp {
@@ -1251,10 +1259,12 @@ fn create_woz_file(
     for i in 0..160 {
         if i < woz_tracks.len() && !woz_tracks[i].flux_data.is_empty() {
             let flux_data = &woz_tracks[i].flux_data;
+            let step = 72 / args.resolution;
             let gap = get_gap_array(flux_data);
             let bit_timing = args.bit_timing;
-            let normalized_gap = get_normalized_gap_array(&gap, bit_timing);
-            let tmap_data = decrunch_stream_woz(flux_data.len(), &normalized_gap, bit_timing);
+            let normalized_gap = get_normalized_gap_array(&gap, bit_timing * step);
+            let tmap_data =
+                decrunch_stream_woz(flux_data.len(), &normalized_gap, bit_timing * step);
             let data = if flux_map_data[i] != 0xff {
                 &crunch_stream(flux_data)
             } else {
