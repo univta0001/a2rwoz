@@ -272,7 +272,7 @@ fn process_flux_capture<F>(
     data_input: (&[u8], &mut usize, &mut Args),
     capture: &Capture,
     break_condition: u8,
-    speed_offset_calc: impl Fn(usize) -> usize,
+    data_offset: usize,
     read_data_fn: F,
     hard_sector_count: Option<u8>,
 ) -> Vec<WozTrackEntry>
@@ -288,7 +288,7 @@ where
     let label = get_label(capture);
     let debug = args.debug;
 
-    let estimated_bit_timing = get_speed(data, speed_offset_calc(*offset));
+    let estimated_bit_timing = get_speed(data, *offset + data_offset);
     a2_debug!(
         debug,
         "{label}: Estimated bit timing : {}",
@@ -338,7 +338,7 @@ fn process_strm_data(
     capture: Capture,
     args: &mut Args,
 ) -> Vec<WozTrackEntry> {
-    let speed_offset_calc = |current_offset: usize| current_offset + 10;
+    let data_offset = 10;
     let read_data_fn = |data: &[u8], current_offset: usize, capture: &Capture, _: Option<u8>| {
         let location = data[current_offset];
         let capture_type = data[current_offset + 1];
@@ -359,7 +359,7 @@ fn process_strm_data(
         (data, offset, args),
         &capture,
         0xff,
-        speed_offset_calc,
+        data_offset,
         read_data_fn,
         None,
     )
@@ -374,9 +374,7 @@ fn process_rwcp_slvd(
 ) -> Vec<WozTrackEntry> {
     let capture_type_enum = if rwcp { Capture::Rwcp } else { Capture::Slvd };
 
-    let speed_offset_calc =
-        |current_offset: usize| current_offset + 9 + 4 * data[current_offset + 4] as usize;
-
+    let data_offset = 9 + 4 * data[*offset + 4] as usize;
     let read_data_fn =
         |data: &[u8], current_offset: usize, _capture: &Capture, hard_sector_count: Option<u8>| {
             let capture_type = data[current_offset + 1];
@@ -418,7 +416,7 @@ fn process_rwcp_slvd(
         (data, offset, args),
         &capture_type_enum,
         0x58,
-        speed_offset_calc,
+        data_offset,
         read_data_fn,
         Some(hard_sector_count),
     )
