@@ -375,16 +375,22 @@ fn process_rwcp_slvd(
             *offset += 7;
         }
 
-        for item in index_signals.iter_mut().take(index_signals_size) {
-            *item = read_a2r_u32(data, *offset) as usize;
-            *offset += 4;
+        if index_signals_size > 0 {
+            for item in index_signals.iter_mut().take(index_signals_size) {
+                *item = read_a2r_u32(data, *offset) as usize;
+                *offset += 4;
+            }
         }
 
         let length = read_a2r_u32(data, *offset);
         let loop_point = if index_signals_size == 0 {
             length
         } else {
-            index_signals[hard_sector_count as usize] as u32
+            if rwcp {
+                index_signals[hard_sector_count as usize] as u32
+            } else {
+                index_signals[0]
+            }
         };
 
         *offset += 4;
@@ -1460,7 +1466,7 @@ fn parse_track_ranges(s: &str) -> Result<Vec<u8>, Box<dyn Error + Sync + Send>> 
             let start = u8::from_str(start_str.trim())
                 .map_err(|_| format!("Invalid number in range start: '{start_str}'"))?;
             let end = u8::from_str(end_str.trim())
-                .map_err(|_| format!("Invalid number in range start: '{start_str}'"))?;
+                .map_err(|_| format!("Invalid number in range end: '{end_str}'"))?;
 
             if start > end {
                 return Err(
