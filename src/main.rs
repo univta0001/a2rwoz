@@ -36,7 +36,7 @@ struct WozTrackEntry {
     flux_data: Vec<u8>,
     loop_accuracy: usize,
     capture_type: u8,
-    original_flux_data: Vec<u8>
+    original_flux_data: Vec<u8>,
 }
 
 fn parse_creator(s: &str) -> Result<String, String> {
@@ -271,10 +271,9 @@ fn get_label(capture: &Capture) -> &'static str {
 fn process_flux_capture<F>(
     data_input: (&[u8], &mut usize, &mut Args),
     capture: &Capture,
-    initial_offset_advance: usize,
+    break_condition: u8,
     speed_offset_calc: impl Fn(usize) -> usize,
     read_data_fn: F,
-    should_break: impl Fn(u8) -> bool,
     hard_sector_count: Option<u8>,
 ) -> Vec<WozTrackEntry>
 where
@@ -285,8 +284,6 @@ where
     for _ in 0..160 {
         woz_track.push(WozTrackEntry::default());
     }
-
-    *offset += initial_offset_advance;
 
     let label = get_label(capture);
     let debug = args.debug;
@@ -309,7 +306,7 @@ where
         bar.set_position((*offset - initial) as u64);
 
         let current_byte = data[*offset];
-        if should_break(current_byte) {
+        if current_byte == break_condition {
             break;
         }
 
@@ -361,10 +358,9 @@ fn process_strm_data(
     process_flux_capture(
         (data, offset, args),
         &capture,
-        0, // No initial offset advance for STRM
+        0xff,
         speed_offset_calc,
         read_data_fn,
-        |location| location == 0xff, // Break condition for STRM/DATA
         None,
     )
 }
@@ -417,13 +413,13 @@ fn process_rwcp_slvd(
             (location, capture_type, length, loop_point, bytes_read)
         };
 
+    *offset += 16;
     process_flux_capture(
         (data, offset, args),
         &capture_type_enum,
-        16, // Initial offset advance for RWCP/SLVD
+        0x58,
         speed_offset_calc,
         read_data_fn,
-        |current_byte| current_byte == 0x58, // Break condition for RWCP/SLVD
         Some(hard_sector_count),
     )
 }
@@ -565,7 +561,7 @@ fn analyze_flux_data(
                     flux_data: loop_flux_data.to_vec(),
                     loop_accuracy: accuracy,
                     capture_type,
-                    original_flux_data: flux_data.to_vec()
+                    original_flux_data: flux_data.to_vec(),
                 };
                 woz_track[location as usize] = woz_entry;
             }
