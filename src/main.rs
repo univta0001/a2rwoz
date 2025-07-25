@@ -527,7 +527,9 @@ fn analyze_flux_data(
             // 3. If accuracy = 100% is encountered, replaced with a newer one
             let (_, _, old_accuracy, old_ct, _) = woz_track[location as usize];
             if capture_type > old_ct
-                || (capture_type == old_ct && accuracy >= old_accuracy && loop_flux_data.len() > 0)
+                || (capture_type == old_ct
+                    && accuracy >= old_accuracy
+                    && !loop_flux_data.is_empty())
             {
                 woz_track[location as usize] = (
                     true,
@@ -591,7 +593,7 @@ fn analyze_flux_data(
 
 fn find_loop(
     normalized_gap: &[usize],
-    _pos: u8,
+    pos: u8,
     _capture_type: u8,
     loop_point: u32,
 ) -> Option<(usize, usize, usize)> {
@@ -600,6 +602,9 @@ fn find_loop(
     const MAX_ALLOWABLE_INDICES: usize = 1000;
     const ACCURACY_MULTIPLIER: usize = 10000;
     const PERFECT_ACCURACY: usize = 10000;
+    if pos >= 160 {
+        return None;
+    }
 
     if normalized_gap.is_empty() || normalized_gap.len() < SAMPLE_SIZE {
         return None;
@@ -608,7 +613,7 @@ fn find_loop(
     let cumulative_gap = get_cumulative_gap_array(normalized_gap);
     let loop_point = (loop_point as u64 * 1020484 / 1000000) as usize;
     let lower = cumulative_gap
-        .binary_search(&(loop_point.saturating_sub(LOOP_POINT_DELTA) as usize))
+        .binary_search(&(loop_point.saturating_sub(LOOP_POINT_DELTA)))
         .unwrap_or_else(|idx| idx);
     let upper = cumulative_gap
         .binary_search(&(loop_point + LOOP_POINT_DELTA))
@@ -658,7 +663,7 @@ fn find_loop(
                     };
 
                     if update_best_match {
-                        result = Some((index - 1, indices[i] - 1, accuracy));
+                        result = Some((index, indices[i], accuracy));
                     }
 
                     if accuracy == PERFECT_ACCURACY {
@@ -917,12 +922,7 @@ fn main() -> Result<(), AppError> {
     let mut args = Args::parse();
 
     let now = std::time::Instant::now();
-    let bytes = std::fs::read(&args.input)?;
-
-    let mut dsk = Vec::new();
-    for &byte in bytes.iter() {
-        dsk.push(byte);
-    }
+    let dsk = std::fs::read(&args.input)?;
 
     // Check for WOZ format
     let header = read_a2r_u32(&dsk, 0);
@@ -1167,19 +1167,15 @@ fn create_woz_file(
         } else if args.woz {
             if i < woz_tracks.len() && !woz_tracks[i].1.is_empty() {
                 tmap_map_data[i] = track_index;
-                if args.duplicate_quarter_tracks {
-                    if i % 4 == 0 {
-                        duplicate_tracks(i, track_index, &mut tmap_map_data);
-                    }
+                if args.duplicate_quarter_tracks && i % 4 == 0 {
+                    duplicate_tracks(i, track_index, &mut tmap_map_data);
                 }
                 track_index += 1;
             }
         } else if i < woz_tracks.len() && !woz_tracks[i].1.is_empty() {
             flux_map_data[i] = track_index;
-            if args.duplicate_quarter_tracks {
-                if i % 4 == 0 {
-                    duplicate_tracks(i, track_index, &mut flux_map_data);
-                }
+            if args.duplicate_quarter_tracks && i % 4 == 0 {
+                duplicate_tracks(i, track_index, &mut flux_map_data);
             }
             track_index += 1;
             flux_enabled = true;
