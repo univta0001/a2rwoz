@@ -125,8 +125,8 @@ struct Args {
     #[arg(long)]
     debug: bool,
 
-    #[arg(long, hide = true, default_value_t = 72)]
-    resolution: u8,
+    #[arg(long, hide = true, default_value_t = 125000)]
+    resolution: u32,
 
     #[arg(index = 1, value_name = "input.a2r")]
     input: String,
@@ -379,8 +379,13 @@ fn process_rwcp_slvd(
 
     let label = get_label(&capture_type_enum);
     let debug = args.debug;
-    a2_debug!(debug, "{label}: Resolution : {}", data[*offset + 1]);
-    args.resolution = data[*offset + 1];
+    args.resolution = read_a2r_u32(data, *offset + 1);
+    
+    if args.resolution == 0 {
+        args.resolution = 62500;
+    }
+    
+    a2_debug!(debug, "{label}: Resolution : {} ps", args.resolution);
 
     let data_offset = 9 + 4 * data[*offset + 4] as usize;
     let read_data_fn =
@@ -1261,7 +1266,7 @@ fn create_woz_file(
     for i in 0..160 {
         if i < woz_tracks.len() && !woz_tracks[i].flux_data.is_empty() {
             let flux_data = &woz_tracks[i].flux_data;
-            let mut step = 72 / args.resolution;
+            let mut step = (125000 / args.resolution) as u8;
 
             if step == 0 {
                 step = 1;
