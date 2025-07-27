@@ -24,7 +24,7 @@ const A2R_STRM_CHUNK: u32 = 0x4d525453;
 const A2R_DATA_CHUNK: u32 = 0x41544144;
 const A2R_META_CHUNK: u32 = 0x4154454d;
 
-const LOOP_POINT_DELTA: usize = 64000;
+const LOOP_POINT_DELTA: u32 = 64000;
 
 /// Maximum allowed mismatch ratio when comparing two tracks
 const MAX_MISMATCH_RATIO: f64 = 0.001; // 0.1 %
@@ -34,7 +34,7 @@ const LABEL: &str = "A2RWOZ";
 struct WozTrackEntry {
     loop_found: bool,
     flux_data: Vec<u8>,
-    loop_accuracy: usize,
+    loop_accuracy: u32,
     capture_type: u8,
     original_flux_data: Vec<u8>,
 }
@@ -543,11 +543,11 @@ fn analyze_flux_data(
     if let Some((start, end, accuracy)) =
         find_loop(&normalized_gap, location, capture_type, loop_point)
     {
-        if start < end && start < cumulative_gap.len() && end < cumulative_gap.len() {
-            let start = cumulative_gap[start];
-            let end = cumulative_gap[end];
+        if start < end && start < cumulative_gap.len() as u32 && end < cumulative_gap.len() as u32 {
+            let start = cumulative_gap[start as usize];
+            let end = cumulative_gap[end as usize];
 
-            let loop_flux_data = &decompressed[start..end];
+            let loop_flux_data = &decompressed[start as usize..end as usize];
             a2_debug!(
                 debug,
                 "{label}: Track: {} Len: {} End: {} Accuracy: {}%",
@@ -638,16 +638,16 @@ fn analyze_flux_data(
 }
 
 fn find_loop(
-    normalized_gap: &[usize],
+    normalized_gap: &[u32],
     pos: u8,
     _capture_type: u8,
     loop_point: u32,
-) -> Option<(usize, usize, usize)> {
+) -> Option<(u32, u32, u32)> {
     const SAMPLE_SIZE: usize = 100;
     const OFFSET_LIMIT: usize = 256;
     const MAX_ALLOWABLE_INDICES: usize = 1000;
-    const ACCURACY_MULTIPLIER: usize = 10000;
-    const PERFECT_ACCURACY: usize = 10000;
+    const ACCURACY_MULTIPLIER: u32 = 10000;
+    const PERFECT_ACCURACY: u32 = 10000;
     if pos >= 160 {
         return None;
     }
@@ -657,7 +657,7 @@ fn find_loop(
     }
 
     let cumulative_gap = get_cumulative_gap_array(normalized_gap);
-    let loop_point = (loop_point as u64 * 1020484 / 1000000) as usize;
+    let loop_point = (loop_point as u64 * 1020484 / 1000000) as u32;
     let lower = cumulative_gap
         .binary_search(&(loop_point.saturating_sub(LOOP_POINT_DELTA)))
         .unwrap_or_else(|idx| idx);
@@ -672,26 +672,26 @@ fn find_loop(
         }
 
         let signature = &normalized_gap[index..index + SAMPLE_SIZE];
-        let indices: Vec<usize> = normalized_gap
+        let indices: Vec<u32> = normalized_gap
             .windows(SAMPLE_SIZE)
             .enumerate()
             .skip(lower)
             .take_while(|&(i, _)| i < upper)
             .filter(|&(_, window)| window == signature)
-            .map(|(i, _)| i)
+            .map(|(i, _)| i as u32)
             .collect();
 
         if !indices.is_empty() && indices.len() < MAX_ALLOWABLE_INDICES {
             for i in 0..indices.len() {
-                if indices[i] > 0 && index < indices[i] {
-                    let segment = &normalized_gap[index..indices[i]];
+                if indices[i] > 0 && index < indices[i] as usize {
+                    let segment = &normalized_gap[index..indices[i] as usize];
 
                     if segment.is_empty() {
                         continue;
                     }
 
-                    let compare_data = &normalized_gap[indices[i]..];
-                    let compare_len = compare_data.len().min(segment.len());
+                    let compare_data = &normalized_gap[indices[i] as usize..];
+                    let compare_len = compare_data.len().min(segment.len()) as u32;
                     if compare_len == 0 {
                         continue;
                     }
@@ -699,7 +699,7 @@ fn find_loop(
                         .iter()
                         .zip(compare_data.iter())
                         .filter(|&(a, b)| a == b)
-                        .count();
+                        .count() as u32;
                     accuracy = accuracy * ACCURACY_MULTIPLIER / compare_len;
 
                     let update_best_match = if let Some((_, _, old_accuracy)) = result {
@@ -709,7 +709,7 @@ fn find_loop(
                     };
 
                     if update_best_match {
-                        result = Some((index, indices[i], accuracy));
+                        result = Some((index as u32, indices[i], accuracy));
                     }
 
                     if accuracy == PERFECT_ACCURACY {
@@ -741,25 +741,25 @@ fn decrunch_stream(flux_record: &[u8]) -> Vec<u8> {
     v
 }
 
-fn _decrunch_stream_flux(flux_record: &[usize]) -> Vec<u8> {
-    let total_output_size: usize = flux_record.iter().sum();
-    let mut v = Vec::with_capacity(total_output_size);
+fn _decrunch_stream_flux(flux_record: &[u32]) -> Vec<u8> {
+    let total_output_size: u32 = flux_record.iter().sum();
+    let mut v = Vec::with_capacity(total_output_size as usize);
     for &b in flux_record {
         if b > 0 {
             v.push(1);
-            v.extend(std::iter::repeat_n(0, b - 1));
+            v.extend(std::iter::repeat_n(0, b as usize - 1));
         }
     }
     v
 }
 
-fn decrunch_stream_woz(flux_len: usize, flux_record: &[usize], bit_timing: u8) -> Vec<u8> {
-    let bit_timing = bit_timing as usize;
+fn decrunch_stream_woz(flux_len: usize, flux_record: &[u32], bit_timing: u8) -> Vec<u8> {
+    let bit_timing = bit_timing as u32;
     let mut v = Vec::with_capacity(flux_len);
     for &flux_total in flux_record.iter() {
         let flux_total = flux_total / bit_timing;
         if flux_total > 1 {
-            v.extend(std::iter::repeat_n(0, flux_total - 1));
+            v.extend(std::iter::repeat_n(0, flux_total as usize - 1));
         }
         v.push(1);
     }
@@ -812,7 +812,7 @@ fn crunch_stream_woz(data: &[u8]) -> Vec<u8> {
     result
 }
 
-fn get_gap_array(data: &[u8]) -> Vec<usize> {
+fn get_gap_array(data: &[u8]) -> Vec<u32> {
     let mut gap = Vec::with_capacity(data.len());
     let mut i = 0;
     while i < data.len() {
@@ -822,12 +822,12 @@ fn get_gap_array(data: &[u8]) -> Vec<usize> {
             i += 1;
             j += 1;
         }
-        gap.push(j)
+        gap.push(j as u32)
     }
     gap
 }
 
-fn get_cumulative_gap_array(gap: &[usize]) -> Vec<usize> {
+fn get_cumulative_gap_array(gap: &[u32]) -> Vec<u32> {
     let mut cumulative_sum = 0;
     gap.iter()
         .map(|&item| {
@@ -837,14 +837,14 @@ fn get_cumulative_gap_array(gap: &[usize]) -> Vec<usize> {
         .collect()
 }
 
-fn get_normalized_gap_array(gap: &[usize], bit_timing: u8) -> Vec<usize> {
+fn get_normalized_gap_array(gap: &[u32], bit_timing: u8) -> Vec<u32> {
     gap.iter()
         .map(|&item| normalized_value(item, bit_timing))
         .collect()
 }
 
-fn normalized_value(value: usize, bit_timing: u8) -> usize {
-    let bit_timing = bit_timing as usize;
+fn normalized_value(value: u32, bit_timing: u8) -> u32 {
+    let bit_timing = bit_timing as u32;
     ((value + (bit_timing / 2)) / bit_timing) * bit_timing
 }
 
@@ -852,12 +852,12 @@ fn compare_track(track: &[u8], prev_track: &[u8], bit_timing: u8) -> bool {
     let compare_len = track.len().min(prev_track.len());
     let track = &track[0..compare_len];
     let prev_track = &prev_track[0..compare_len];
-    let mismatches: usize = track
+    let mismatches: u32 = track
         .iter()
         .zip(prev_track.iter())
         .map(|(&a, &b)| {
-            (normalized_value(a as usize, bit_timing) != normalized_value(b as usize, bit_timing))
-                as usize
+            (normalized_value(a as u32, bit_timing) != normalized_value(b as u32, bit_timing))
+                as u32
         })
         .sum();
     (mismatches as f64 / compare_len as f64) < MAX_MISMATCH_RATIO
@@ -1172,6 +1172,7 @@ fn create_woz_file(
     let mut track_index = 0;
     let mut flux_enabled = false;
     let mut processed_tracks: Vec<u8> = Vec::new();
+    let mut prev_track_index = None;
     let ignore_tracks: Vec<usize> = args
         .delete_tracks
         .as_ref()
@@ -1191,23 +1192,24 @@ fn create_woz_file(
         if args.compare_tracks {
             let mut found = 0xff;
             if i < woz_tracks.len() && !woz_tracks[i].flux_data.is_empty() {
-                for (index, &item) in processed_tracks.iter().enumerate() {
-                    let prev_track = &woz_tracks[item as usize].original_flux_data;
+                if let Some((prev_index, prev_value)) = prev_track_index {
+                    let prev_track = &woz_tracks[prev_value as usize].original_flux_data;
                     if compare_track(
                         &woz_tracks[i].original_flux_data,
                         prev_track,
                         args.bit_timing,
                     ) {
-                        found = index as u8;
-                        break;
+                        found = prev_index as u8;
+                        prev_track_index = Some((prev_index, prev_value))
+                    } else {
+                        found = processed_tracks.len() as u8;
+                        processed_tracks.push(i as u8);
+                        prev_track_index = Some((found, i));
                     }
-                }
-
-                if found == 0xff {
+                } else {
                     found = processed_tracks.len() as u8;
                     processed_tracks.push(i as u8);
-                } else {
-                    woz_tracks[i].flux_data.clear();
+                    prev_track_index = Some((found, i));
                 }
             }
             if args.woz {
