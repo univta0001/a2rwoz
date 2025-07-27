@@ -380,11 +380,11 @@ fn process_rwcp_slvd(
     let label = get_label(&capture_type_enum);
     let debug = args.debug;
     args.resolution = read_a2r_u32(data, *offset + 1);
-    
+
     if args.resolution == 0 {
         args.resolution = 62500;
     }
-    
+
     a2_debug!(debug, "{label}: Resolution : {} ps", args.resolution);
 
     let data_offset = 9 + 4 * data[*offset + 4] as usize;
@@ -579,7 +579,7 @@ fn analyze_flux_data(
         }
     } else if args.use_fft {
         let mut data: Vec<_> = decompressed.clone();
-        if data.len() < 2 * (loop_point + LOOP_POINT_DELTA as u32) as usize {
+        if data.len() < 2 * (loop_point + LOOP_POINT_DELTA) as usize {
             let len = data.len() * 3 / 4;
             for &item in decompressed.iter().take(len) {
                 data.push(item)
@@ -588,8 +588,8 @@ fn analyze_flux_data(
 
         if let Ok(end) = find_loop_point_fft(
             &data,
-            (loop_point - LOOP_POINT_DELTA as u32) as usize,
-            (loop_point + LOOP_POINT_DELTA as u32) as usize,
+            (loop_point - LOOP_POINT_DELTA) as usize,
+            (loop_point + LOOP_POINT_DELTA) as usize,
         ) {
             let mut loop_flux_data = Vec::new();
             for &item in data.iter().take(end) {
@@ -848,19 +848,34 @@ fn normalized_value(value: u32, bit_timing: u8) -> u32 {
     ((value + (bit_timing / 2)) / bit_timing) * bit_timing
 }
 
+fn normalized_track(track: &[u8], bit_timing: u8) -> Vec<u8> {
+    let mut v = Vec::new();
+    for &item in track.iter() {
+        v.push(normalized_value(item as u32, bit_timing) as u8);
+    }
+    v
+}
+
 fn compare_track(track: &[u8], prev_track: &[u8], bit_timing: u8) -> bool {
     let compare_len = track.len().min(prev_track.len());
-    let track = &track[0..compare_len];
-    let prev_track = &prev_track[0..compare_len];
-    let mismatches: u32 = track
-        .iter()
-        .zip(prev_track.iter())
-        .map(|(&a, &b)| {
-            (normalized_value(a as u32, bit_timing) != normalized_value(b as u32, bit_timing))
-                as u32
-        })
-        .sum();
-    (mismatches as f64 / compare_len as f64) < MAX_MISMATCH_RATIO
+    let track = &normalized_track(&track[0..compare_len], bit_timing);
+    let prev_track = &normalized_track(&prev_track[0..compare_len], bit_timing);
+    let mut best_mismatch = u32::MAX;
+    let iter_count = 16;
+    for i in 0..iter_count {
+        for j in 0..iter_count {
+            let mismatches: u32 = track[i..]
+                .iter()
+                .zip(prev_track[j..].iter())
+                .map(|(&a, &b)| (a != b) as u32)
+                .sum();
+            if mismatches < best_mismatch {
+                best_mismatch = mismatches
+            }
+        }
+    }
+
+    (best_mismatch as f64 / compare_len as f64) < MAX_MISMATCH_RATIO
 }
 
 fn _cross_correlation_sameness_ratio_fft(arr1: &[u8], arr2: &[u8]) -> f64 {
@@ -1172,7 +1187,7 @@ fn create_woz_file(
     let mut track_index = 0;
     let mut flux_enabled = false;
     let mut processed_tracks: Vec<u8> = Vec::new();
-    let mut prev_track_index = None;
+    let mut prev_match_track: Option<(u8, usize)> = None;
     let ignore_tracks: Vec<usize> = args
         .delete_tracks
         .as_ref()
@@ -1192,24 +1207,22 @@ fn create_woz_file(
         if args.compare_tracks {
             let mut found = 0xff;
             if i < woz_tracks.len() && !woz_tracks[i].flux_data.is_empty() {
-                if let Some((prev_index, prev_value)) = prev_track_index {
-                    let prev_track = &woz_tracks[prev_value as usize].original_flux_data;
+                if let Some((prev_index, prev_match)) = prev_match_track {
+                    let prev_track = &woz_tracks[prev_match].original_flux_data;
                     if compare_track(
                         &woz_tracks[i].original_flux_data,
                         prev_track,
                         args.bit_timing,
                     ) {
-                        found = prev_index as u8;
-                        prev_track_index = Some((prev_index, prev_value))
-                    } else {
-                        found = processed_tracks.len() as u8;
-                        processed_tracks.push(i as u8);
-                        prev_track_index = Some((found, i));
+                        found = prev_index;
+                        woz_tracks[i].flux_data.clear();
                     }
-                } else {
+                }
+
+                if found == 0xff {
                     found = processed_tracks.len() as u8;
                     processed_tracks.push(i as u8);
-                    prev_track_index = Some((found, i));
+                    prev_match_track = Some((found, i))
                 }
             }
             if args.woz {
