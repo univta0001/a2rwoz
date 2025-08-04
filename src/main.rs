@@ -1,7 +1,6 @@
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use rustfft::{FftPlanner, num_complex::Complex};
-use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::f32;
@@ -10,6 +9,7 @@ use std::io::IsTerminal;
 use std::io::Write;
 use std::path::Path;
 use std::str::FromStr;
+use std::string::FromUtf8Error;
 
 type AppError = Box<dyn Error>;
 
@@ -24,10 +24,17 @@ const A2R_STRM_CHUNK: u32 = 0x4d525453;
 const A2R_DATA_CHUNK: u32 = 0x41544144;
 const A2R_META_CHUNK: u32 = 0x4154454d;
 
-const LOOP_POINT_DELTA: u32 = 64000;
+const WOZ_MAX_TRACKS: usize = 160;
+const WOZ_CREATOR_LEN: usize = 32;
+const WOZ_BLOCK_SIZE: usize = 512;
+
+const LOOP_POINT_DELTA: u32 = 128000;
 
 /// Maximum allowed mismatch ratio when comparing two tracks
 const MAX_MISMATCH_RATIO: f64 = 0.001; // 0.1 %
+const ACCURACY_MULTIPLIER: u32 = 10000;
+const PERFECT_ACCURACY: u32 = 10000;
+
 const LABEL: &str = "A2RWOZ";
 
 #[derive(Default)]
@@ -40,7 +47,7 @@ struct WozTrackEntry {
 }
 
 fn parse_creator(s: &str) -> Result<String, String> {
-    if s.len() > 32 {
+    if s.len() > WOZ_CREATOR_LEN {
         Err(format!(
             "Creator cannot exceed 32 characters (got {} characters)",
             s.len()
@@ -120,6 +127,10 @@ struct Args {
     /// Show tracks that are not solved
     #[arg(long)]
     show_unsolved_tracks: bool,
+
+    /// Enable KMP algorithm
+    #[arg(long)]
+    kmp: bool,
 
     /// Enable debug
     #[arg(long)]
@@ -219,29 +230,23 @@ fn is_terminal(stderr: bool) -> bool {
 }
 
 fn read_a2r_u32(dsk: &[u8], offset: usize) -> u32 {
-    dsk[offset] as u32
-        + (dsk[offset + 1] as u32) * 256
-        + (dsk[offset + 2] as u32) * 65536
-        + (dsk[offset + 3] as u32) * 16777216
+    let mut data = [0u8; 4];
+    data.copy_from_slice(&dsk[offset..offset + 4]);
+    u32::from_le_bytes(data)
 }
 
 fn read_a2r_big_u32(dsk: &[u8], offset: usize) -> u32 {
-    dsk[offset + 3] as u32
-        + (dsk[offset + 2] as u32) * 256
-        + (dsk[offset + 1] as u32) * 65536
-        + (dsk[offset] as u32) * 16777216
+    let mut data = [0u8; 4];
+    data.copy_from_slice(&dsk[offset..offset + 4]);
+    u32::from_be_bytes(data)
 }
 
 fn write_woz_u32(dsk: &mut Vec<u8>, value: u32) {
-    dsk.push((value & 0xff) as u8);
-    dsk.push(((value >> 8) & 0xff) as u8);
-    dsk.push(((value >> 16) & 0xff) as u8);
-    dsk.push(((value >> 24) & 0xff) as u8);
+    dsk.extend_from_slice(&value.to_le_bytes());
 }
 
 fn write_woz_u16(dsk: &mut Vec<u8>, value: u16) {
-    dsk.push((value & 0xff) as u8);
-    dsk.push(((value >> 8) & 0xff) as u8);
+    dsk.extend_from_slice(&value.to_le_bytes());
 }
 
 fn process_info(data: &[u8], offset: usize, info: &mut Info, a2r3: bool) {
@@ -284,7 +289,7 @@ where
 {
     let (data, offset, args) = data_input;
     let mut woz_track = Vec::new();
-    for _ in 0..160 {
+    for _ in 0..WOZ_MAX_TRACKS {
         woz_track.push(WozTrackEntry::default());
     }
 
@@ -302,7 +307,7 @@ where
         args.bit_timing = estimated_bit_timing
     }
 
-    let bar = create_progress_bar((data.len() - *offset) as u64);
+    let bar = create_progress_bar((data.len() - *offset) as u64, args.debug);
     let initial = *offset;
 
     while *offset < data.len() {
@@ -530,7 +535,7 @@ fn analyze_flux_data(
 
     let flux_data = &data[offset..offset + length as usize];
     let decompressed = decrunch_stream(flux_data);
-    let gap = get_gap_array(&decompressed);
+    let gap = get_gap_array(&decompressed, 0);
     let cumulative_gap = get_cumulative_gap_array(&gap);
     let normalized_gap = get_normalized_gap_array(&gap, bit_timing);
 
@@ -540,9 +545,13 @@ fn analyze_flux_data(
 
     //let decompressed = decrunch_stream_flux(&normalized_gap);
 
-    if let Some((start, end, accuracy)) =
-        find_loop(&normalized_gap, location, capture_type, loop_point)
-    {
+    if let Some((start, end, accuracy)) = find_loop(
+        &normalized_gap,
+        location,
+        capture_type,
+        loop_point,
+        args.kmp,
+    ) {
         if start < end && start < cumulative_gap.len() as u32 && end < cumulative_gap.len() as u32 {
             let start = cumulative_gap[start as usize];
             let end = cumulative_gap[end as usize];
@@ -642,66 +651,85 @@ fn find_loop(
     pos: u8,
     _capture_type: u8,
     loop_point: u32,
+    kmp: bool,
 ) -> Option<(u32, u32, u32)> {
-    const SAMPLE_SIZE: usize = 100;
     const OFFSET_LIMIT: usize = 256;
-    const MAX_ALLOWABLE_INDICES: usize = 1000;
-    const ACCURACY_MULTIPLIER: u32 = 10000;
-    const PERFECT_ACCURACY: u32 = 10000;
-    if pos >= 160 {
+
+    if pos >= WOZ_MAX_TRACKS as u8 {
         return None;
     }
 
-    if normalized_gap.is_empty() || normalized_gap.len() < SAMPLE_SIZE {
+    if normalized_gap.is_empty() || normalized_gap.len() < OFFSET_LIMIT {
         return None;
     }
 
     let cumulative_gap = get_cumulative_gap_array(normalized_gap);
     let loop_point = (loop_point as u64 * 1020484 / 1000000) as u32;
-    let lower = cumulative_gap
-        .binary_search(&(loop_point.saturating_sub(LOOP_POINT_DELTA)))
-        .unwrap_or_else(|idx| idx);
-    let upper = cumulative_gap
-        .binary_search(&(loop_point + LOOP_POINT_DELTA))
-        .unwrap_or_else(|idx| idx);
+    let lower =
+        cumulative_gap.partition_point(|&p| p < loop_point.saturating_sub(LOOP_POINT_DELTA));
+    let upper = cumulative_gap.partition_point(|&p| p <= loop_point + LOOP_POINT_DELTA);
 
     let mut result = None;
-    for index in 1..OFFSET_LIMIT {
-        if index + SAMPLE_SIZE > normalized_gap.len() {
-            continue;
+    for index in 0..OFFSET_LIMIT {
+        if !kmp {
+            result = find_loop_using_sliding_window(index, normalized_gap, lower, upper);
+        } else {
+            result = find_loop_using_kmp_lps(index, normalized_gap, _capture_type);
         }
 
-        let signature = &normalized_gap[index..index + SAMPLE_SIZE];
-        let indices: Vec<u32> = normalized_gap
-            .windows(SAMPLE_SIZE)
-            .enumerate()
-            .skip(lower)
-            .take_while(|&(i, _)| i < upper)
-            .filter(|&(_, window)| window == signature)
-            .map(|(i, _)| i as u32)
-            .collect();
+        if result.is_some() {
+            break;
+        }
+    }
+    result
+}
 
-        if !indices.is_empty() && indices.len() < MAX_ALLOWABLE_INDICES {
-            for i in 0..indices.len() {
-                if indices[i] > 0 && index < indices[i] as usize {
-                    let segment = &normalized_gap[index..indices[i] as usize];
+fn find_loop_using_kmp_lps(
+    index: usize,
+    normalized_gap: &[u32],
+    _capture_type: u8,
+) -> Option<(u32, u32, u32)> {
+    let normalized_gap = &normalized_gap[index..];
+    let lps = compute_kmp_lps(normalized_gap);
+    let lps_len = lps[lps.len() - 1];
+    if lps_len == 0 {
+        return None;
+    }
+    let period = lps.len() - lps_len;
 
-                    if segment.is_empty() {
-                        continue;
-                    }
+    compute_accuracy(normalized_gap, 0, period)
+        .map(|accuracy| (index as u32, (index + period) as u32, accuracy))
+}
 
-                    let compare_data = &normalized_gap[indices[i] as usize..];
-                    let compare_len = compare_data.len().min(segment.len()) as u32;
-                    if compare_len == 0 {
-                        continue;
-                    }
-                    let mut accuracy = segment
-                        .iter()
-                        .zip(compare_data.iter())
-                        .filter(|&(a, b)| a == b)
-                        .count() as u32;
-                    accuracy = accuracy * ACCURACY_MULTIPLIER / compare_len;
+fn find_loop_using_sliding_window(
+    index: usize,
+    normalized_gap: &[u32],
+    lower: usize,
+    upper: usize,
+) -> Option<(u32, u32, u32)> {
+    const SAMPLE_SIZE: usize = 100;
+    const MAX_ALLOWABLE_INDICES: usize = 1000;
 
+    if index + SAMPLE_SIZE > normalized_gap.len() {
+        return None;
+    }
+
+    let signature = &normalized_gap[index..index + SAMPLE_SIZE];
+    let indices: Vec<u32> = normalized_gap
+        .windows(SAMPLE_SIZE)
+        .enumerate()
+        .skip(lower)
+        .take_while(|&(i, _)| i < upper)
+        .filter(|&(_, window)| window == signature)
+        .map(|(i, _)| i as u32)
+        .collect();
+
+    let mut result = None;
+
+    if !indices.is_empty() && indices.len() < MAX_ALLOWABLE_INDICES {
+        for &item in indices.iter() {
+            if item > 0 && index < item as usize {
+                if let Some(accuracy) = compute_accuracy(normalized_gap, index, item as usize) {
                     let update_best_match = if let Some((_, _, old_accuracy)) = result {
                         accuracy >= old_accuracy
                     } else {
@@ -709,7 +737,7 @@ fn find_loop(
                     };
 
                     if update_best_match {
-                        result = Some((index as u32, indices[i], accuracy));
+                        result = Some((index as u32, item, accuracy));
                     }
 
                     if accuracy == PERFECT_ACCURACY {
@@ -718,12 +746,29 @@ fn find_loop(
                 }
             }
         }
-
-        if result.is_some() {
-            break;
-        }
     }
     result
+}
+
+fn compute_accuracy(normalized_gap: &[u32], start: usize, end: usize) -> Option<u32> {
+    let segment = &normalized_gap[start..end];
+
+    if segment.is_empty() {
+        return None;
+    }
+
+    let compare_data = &normalized_gap[end..];
+    let compare_len = compare_data.len().min(segment.len()) as u32;
+    if compare_len == 0 {
+        return None;
+    }
+    let mut accuracy = segment
+        .iter()
+        .zip(compare_data.iter())
+        .filter(|&(a, b)| a == b)
+        .count() as u32;
+    accuracy = accuracy * ACCURACY_MULTIPLIER / compare_len;
+    Some(accuracy)
 }
 
 fn decrunch_stream(flux_record: &[u8]) -> Vec<u8> {
@@ -812,13 +857,13 @@ fn crunch_stream_woz(data: &[u8]) -> Vec<u8> {
     result
 }
 
-fn get_gap_array(data: &[u8]) -> Vec<u32> {
+fn get_gap_array<T: PartialEq>(data: &[T], zero: T) -> Vec<u32> {
     let mut gap = Vec::with_capacity(data.len());
     let mut i = 0;
     while i < data.len() {
         i += 1;
         let mut j = 1;
-        while i < data.len() && data[i] == 0 {
+        while i < data.len() && data[i] == zero {
             i += 1;
             j += 1;
         }
@@ -827,19 +872,19 @@ fn get_gap_array(data: &[u8]) -> Vec<u32> {
     gap
 }
 
-fn get_cumulative_gap_array(gap: &[u32]) -> Vec<u32> {
+fn get_cumulative_gap_array<T: Into<u32> + Copy>(gap: &[T]) -> Vec<u32> {
     let mut cumulative_sum = 0;
     gap.iter()
         .map(|&item| {
-            cumulative_sum += item;
+            cumulative_sum += item.into();
             cumulative_sum
         })
         .collect()
 }
 
-fn get_normalized_gap_array(gap: &[u32], bit_timing: u8) -> Vec<u32> {
+fn get_normalized_gap_array<T: Into<u32> + Copy>(gap: &[T], bit_timing: u8) -> Vec<u32> {
     gap.iter()
-        .map(|&item| normalized_value(item, bit_timing))
+        .map(|&item| normalized_value(item.into(), bit_timing))
         .collect()
 }
 
@@ -849,11 +894,10 @@ fn normalized_value(value: u32, bit_timing: u8) -> u32 {
 }
 
 fn normalized_track(track: &[u8], bit_timing: u8) -> Vec<u8> {
-    let mut v = Vec::new();
-    for &item in track.iter() {
-        v.push(normalized_value(item as u32, bit_timing) as u8);
-    }
-    v
+    track
+        .iter()
+        .map(|&item| normalized_value(item as u32, bit_timing) as u8)
+        .collect()
 }
 
 fn compare_track(track: &[u8], prev_track: &[u8], bit_timing: u8) -> bool {
@@ -861,7 +905,7 @@ fn compare_track(track: &[u8], prev_track: &[u8], bit_timing: u8) -> bool {
     let track = &normalized_track(&track[0..compare_len], bit_timing);
     let prev_track = &normalized_track(&prev_track[0..compare_len], bit_timing);
     let mut best_mismatch = u32::MAX;
-    let iter_count = 16;
+    let iter_count = std::cmp::min(16, track.len());
     for i in 0..iter_count {
         for j in 0..iter_count {
             let mismatches: u32 = track[i..]
@@ -1025,18 +1069,14 @@ fn main() -> Result<(), AppError> {
                     }
                 } else {
                     print!("{info}");
-                    let metadata = Some(process_meta(&dsk, dsk_offset, chunk_size));
-                    if metadata.is_some() {
-                        print_meta_information(&metadata, false);
-                    }
+                    let metadata = process_meta(&dsk, dsk_offset, chunk_size)?;
+                    print_meta_information(&metadata, false);
                 }
                 dsk_offset += chunk_size as usize;
             }
             A2R_META_CHUNK => {
-                let metadata = Some(process_meta(&dsk, dsk_offset, chunk_size));
-                if metadata.is_some() {
-                    print_meta_information(&metadata, true);
-                }
+                let metadata = process_meta(&dsk, dsk_offset, chunk_size)?;
+                print_meta_information(&metadata, true);
                 dsk_offset += chunk_size as usize;
             }
             _ => dsk_offset += chunk_size as usize,
@@ -1106,29 +1146,32 @@ fn main() -> Result<(), AppError> {
     Ok(())
 }
 
-fn process_meta(dsk: &[u8], offset: usize, chunk_size: u32) -> Cow<'_, str> {
-    String::from_utf8_lossy(&dsk[offset..offset + chunk_size as usize])
+fn process_meta(dsk: &[u8], offset: usize, chunk_size: u32) -> Result<String, FromUtf8Error> {
+    String::from_utf8((dsk[offset..offset + chunk_size as usize]).to_vec())
 }
 
-fn print_meta_information(meta: &Option<Cow<'_, str>>, metainfo: bool) {
-    if let Some(meta) = meta {
-        let label = if metainfo { "META" } else { "INFO" };
-        for row_item in meta.split('\n') {
-            let value: Vec<&str> = row_item.splitn(2, '\t').collect();
-            if value.len() > 1 && !value[1].is_empty() {
-                println!(
-                    "{}{label}{}: {:<20}: {}",
-                    green_color(false),
-                    reset_color(false),
-                    capitalize_first_letter(value[0].trim()),
-                    value[1]
-                );
-            }
+fn print_meta_information(meta: &str, metainfo: bool) {
+    let label = if metainfo { "META" } else { "INFO" };
+    for row_item in meta.lines() {
+        let mut parts = row_item.splitn(2, '\t');
+        if let (Some(key), Some(value)) = (parts.next(), parts.next())
+            && !value.is_empty()
+        {
+            println!(
+                "{}{label}{}: {:<20}: {}",
+                green_color(false),
+                reset_color(false),
+                capitalize_first_letter(key),
+                value
+            );
         }
     }
 }
 
 fn capitalize_first_letter(s: &str) -> String {
+    if s.is_empty() {
+        return s.to_string();
+    }
     s[0..1].to_uppercase() + &s[1..]
 }
 
@@ -1146,7 +1189,7 @@ fn create_woz_file(
     }
 
     if args.show_unsolved_tracks {
-        for (i, item) in woz_tracks.iter().enumerate().take(160) {
+        for (i, item) in woz_tracks.iter().enumerate().take(WOZ_MAX_TRACKS) {
             if !woz_tracks[i].flux_data.is_empty() && woz_tracks[i].loop_accuracy != 10000 {
                 println!(
                     "{}LOOP{}: Track {:5} ({:3})   : {}% accurate",
@@ -1159,8 +1202,6 @@ fn create_woz_file(
             }
         }
     }
-
-    let block_size = 512;
 
     let path = Path::new(&args.output);
     let mut header = Vec::<u8>::new();
@@ -1182,8 +1223,8 @@ fn create_woz_file(
 
     let info_chunk = make_chunk("INFO", &info);
 
-    let mut tmap_map_data = vec![0xff_u8; 160];
-    let mut flux_map_data = vec![0xff_u8; 160];
+    let mut tmap_map_data = vec![0xff_u8; WOZ_MAX_TRACKS];
+    let mut flux_map_data = vec![0xff_u8; WOZ_MAX_TRACKS];
     let mut track_index = 0;
     let mut flux_enabled = false;
     let mut processed_tracks: Vec<u8> = Vec::new();
@@ -1194,8 +1235,8 @@ fn create_woz_file(
         .map(|delete_tracks| delete_tracks.iter().map(|&item| item as usize).collect())
         .unwrap_or_default();
 
-    let bar = create_progress_bar(160);
-    for i in 0..160 {
+    let bar = create_progress_bar(WOZ_MAX_TRACKS as u64, args.debug);
+    for i in 0..WOZ_MAX_TRACKS {
         bar.inc(1);
         let msg = format!("{}", i as f32 / 4.0);
         bar.set_message(msg);
@@ -1278,7 +1319,7 @@ fn create_woz_file(
     let mut largest_tmap_track = 0;
     let mut largest_flux_track = 0;
 
-    for i in 0..160 {
+    for i in 0..WOZ_MAX_TRACKS {
         if i < woz_tracks.len() && !woz_tracks[i].flux_data.is_empty() {
             let flux_data = &woz_tracks[i].flux_data;
             let mut step = (125000 / args.resolution) as u8;
@@ -1287,7 +1328,7 @@ fn create_woz_file(
                 step = 1;
             }
 
-            let gap = get_gap_array(flux_data);
+            let gap = get_gap_array(flux_data, 0);
             let bit_timing = args.bit_timing;
             let normalized_gap = get_normalized_gap_array(&gap, bit_timing * step);
             let tmap_data =
@@ -1298,11 +1339,11 @@ fn create_woz_file(
                 &crunch_stream_woz(&tmap_data)
             };
 
-            let track_len = data.len().div_ceil(block_size) * block_size;
+            let track_len = data.len().div_ceil(WOZ_BLOCK_SIZE) * WOZ_BLOCK_SIZE;
             let mut track_data = vec![0u8; track_len];
             let starting_block = track_start_data;
             track_data[0..data.len()].copy_from_slice(data);
-            let block_count = track_len / block_size;
+            let block_count = track_len / WOZ_BLOCK_SIZE;
             let bit_count = if flux_map_data[i] != 0xff {
                 data.len()
             } else {
@@ -1325,7 +1366,7 @@ fn create_woz_file(
             }
         }
     }
-    trks_data.extend(std::iter::repeat_n(0, 160 * 8 - trks_data.len()));
+    trks_data.extend(std::iter::repeat_n(0, WOZ_MAX_TRACKS * 8 - trks_data.len()));
     trks_data.extend(&fluxs);
 
     let trks_chunk = make_chunk("TRKS", &trks_data);
@@ -1338,8 +1379,8 @@ fn create_woz_file(
     contents.extend(&tmap_chunk);
     contents.extend(&trks_chunk);
 
-    if !contents.len().is_multiple_of(block_size) {
-        let padding = block_size - contents.len() % block_size;
+    if !contents.len().is_multiple_of(WOZ_BLOCK_SIZE) {
+        let padding = WOZ_BLOCK_SIZE - contents.len() % WOZ_BLOCK_SIZE;
         contents.extend(std::iter::repeat_n(0, padding));
     }
 
@@ -1348,21 +1389,16 @@ fn create_woz_file(
 
     if flux_enabled {
         let flux_block = contents.len() / 512;
-        contents[66] = (flux_block & 0xff) as u8;
-        contents[67] = ((flux_block >> 8) & 0xff) as u8;
-        contents[68] = (largest_flux_track & 0xff) as u8;
-        contents[69] = ((largest_flux_track >> 8) & 0xff) as u8;
-        contents.extend(&flux_chunk);
+        contents[66..68].copy_from_slice(&(flux_block as u16).to_le_bytes());
+        contents[68..70].copy_from_slice(&(largest_flux_track as u16).to_le_bytes());
+        contents.extend(&flux_chunk)
     } else {
         // Set the WOZ version to version 2.0
         contents[20] = 2
     }
 
     let crc = crc32(0, &contents[header.len()..]);
-    contents[8] = (crc & 0xff) as u8;
-    contents[9] = ((crc >> 8) & 0xff) as u8;
-    contents[10] = ((crc >> 16) & 0xff) as u8;
-    contents[11] = ((crc >> 24) & 0xff) as u8;
+    contents[8..12].copy_from_slice(&crc.to_le_bytes());
 
     let mut file = std::fs::File::create(path)?;
     file.write_all(&contents)?;
@@ -1374,11 +1410,11 @@ fn duplicate_tracks(index: usize, track_index: u8, map: &mut [u8]) {
     if index > 0 {
         map[index - 1] = track_index;
     }
-    if index + 1 < 160 {
+    if index + 1 < WOZ_MAX_TRACKS {
         map[index + 1] = track_index;
     }
 
-    if index >= 8 && index + 2 < 160 {
+    if index >= 8 && index + 2 < WOZ_MAX_TRACKS {
         map[index + 2] = track_index;
     }
 }
@@ -1410,8 +1446,12 @@ fn crc32(value: u32, buf: &[u8]) -> u32 {
     crc ^ 0xffffffff
 }
 
-fn create_progress_bar(size: u64) -> ProgressBar {
-    let bar = ProgressBar::new(size);
+fn create_progress_bar(size: u64, debug: bool) -> ProgressBar {
+    let bar = if debug {
+        ProgressBar::hidden()
+    } else {
+        ProgressBar::new(size)
+    };
     let progress_style = ProgressStyle::default_bar()
         .template("Processing Track:{msg:>5} {bar:35.green/black} {pos:>7}/{len:7}")
         .unwrap();
@@ -1536,4 +1576,291 @@ fn parse_track_ranges(s: &str) -> Result<Vec<u8>, Box<dyn Error + Sync + Send>> 
         }
     }
     Ok(tracks.into_iter().collect())
+}
+
+/// Computes the Longest Prefix Suffix (LPS) array for the KMP algorithm.
+///
+/// The LPS array (also called "failure function" or "pi" array) stores for each position `i`
+/// the length of the longest proper prefix of the substring `data[0..=i]` that is also a suffix.
+///
+/// # Arguments
+/// * `data` - A slice of elements that implement the `PartialEq` trait
+///
+/// # Returns
+/// A `Vec<usize>` where each element at index `i` contains the length of the longest
+/// proper prefix which is also a suffix for the substring ending at `i`.
+///
+/// # Example
+/// ```
+/// let lps = compute_kmp_lps(b"ABABCABAB");
+/// assert_eq!(lps, vec![0, 0, 1, 2, 0, 1, 2, 3, 4]);
+/// ```
+fn compute_kmp_lps<T: PartialEq>(data: &[T]) -> Vec<usize> {
+    // Initialize LPS array with zeros. First element is always 0 since a single
+    // character has no proper prefix and suffix (proper prefix means not the whole string).
+    let mut pi = vec![0; data.len()];
+
+    // Start processing from the second character (index 1)
+    for i in 1..data.len() {
+        // Start with the length of the previous LPS value
+        let mut j = pi[i - 1];
+
+        // While we have a non-zero prefix length and the current character
+        // doesn't match the character at position j, fall back to the
+        // previous longest prefix-suffix
+        while j > 0 && data[i] != data[j] {
+            j = pi[j - 1];
+        }
+
+        // If characters match, extend the prefix-suffix length by 1
+        if data[i] == data[j] {
+            j += 1
+        }
+
+        // Store the computed prefix-suffix length for current position
+        pi[i] = j
+    }
+    pi
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_track_ranges() {
+        // Test single track
+        let result = parse_track_ranges("5").unwrap();
+        assert_eq!(result, vec![5]);
+
+        // Test multiple tracks
+        let result = parse_track_ranges("1,3,5").unwrap();
+        assert_eq!(result, vec![1, 3, 5]);
+
+        // Test range
+        let result = parse_track_ranges("3-7").unwrap();
+        assert_eq!(result, vec![3, 4, 5, 6, 7]);
+
+        // Test mixed
+        let result = parse_track_ranges("1,3-5,8").unwrap();
+        assert_eq!(result, vec![1, 3, 4, 5, 8]);
+
+        // Test invalid range
+        let result = parse_track_ranges("5-3");
+        assert!(result.is_err());
+
+        // Test invalid number
+        let result = parse_track_ranges("abc");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_read_a2r_u32() {
+        let data = [0x78, 0x56, 0x34, 0x12];
+        assert_eq!(read_a2r_u32(&data, 0), 0x12345678);
+    }
+
+    #[test]
+    fn test_read_a2r_big_u32() {
+        let data = [0x12, 0x34, 0x56, 0x78];
+        assert_eq!(read_a2r_big_u32(&data, 0), 0x12345678);
+    }
+
+    #[test]
+    fn test_write_woz_u32() {
+        let mut buffer = Vec::new();
+        write_woz_u32(&mut buffer, 0x12345678);
+        assert_eq!(buffer, vec![0x78, 0x56, 0x34, 0x12]);
+    }
+
+    #[test]
+    fn test_write_woz_u16() {
+        let mut buffer = Vec::new();
+        write_woz_u16(&mut buffer, 0x1234);
+        assert_eq!(buffer, vec![0x34, 0x12]);
+    }
+
+    #[test]
+    fn test_decrunch_stream() {
+        // Test simple case
+        let input = vec![2, 3, 1];
+        let expected = vec![1, 0, 1, 0, 0, 1];
+        assert_eq!(decrunch_stream(&input), expected);
+
+        // Test with 255 values
+        let input = vec![255, 1, 255, 2];
+        let mut expected = Vec::new();
+        expected.push(1);
+        expected.extend(std::iter::repeat_n(0, 255));
+        expected.push(1);
+        expected.extend(std::iter::repeat_n(0, 256));
+        assert_eq!(decrunch_stream(&input), expected);
+    }
+
+    #[test]
+    fn test_get_gap_array() {
+        let data = vec![1, 0, 0, 1, 0, 1];
+        let expected = vec![3, 2, 1];
+        assert_eq!(get_gap_array(&data, 0), expected);
+    }
+
+    #[test]
+    fn test_get_cumulative_gap_array() {
+        let gap: Vec<u32> = vec![1, 2, 3];
+        let expected = vec![1, 3, 6];
+        assert_eq!(get_cumulative_gap_array(&gap), expected);
+    }
+
+    #[test]
+    fn test_get_normalized_gap_array() {
+        let gap: Vec<u32> = vec![3, 7, 12];
+        let bit_timing = 4;
+        let expected = vec![4, 8, 12];
+        assert_eq!(get_normalized_gap_array(&gap, bit_timing), expected);
+    }
+
+    #[test]
+    fn test_normalized_value() {
+        assert_eq!(normalized_value(3, 4), 4);
+        assert_eq!(normalized_value(5, 4), 4);
+        assert_eq!(normalized_value(6, 4), 8);
+    }
+
+    #[test]
+    fn test_compare_track() {
+        let track1 = vec![1, 0, 1, 0, 1];
+        let track2 = vec![1, 0, 1, 0, 1];
+        assert!(compare_track(&track1, &track2, 32));
+
+        let track3 = vec![1, 0, 0, 0, 1];
+        assert!(compare_track(&track1, &track3, 32));
+    }
+
+    #[test]
+    fn test_crc32() {
+        // Test known CRC32 value
+        let data = b"123456789";
+        assert_eq!(crc32(0, data), 0xCBF43926);
+    }
+
+    #[test]
+    fn test_find_loop() {
+        // Create a pattern that repeats
+        let mut normalized_gap = vec![4, 8, 12, 5, 8, 12, 4, 8, 12];
+        for _ in 0..30 {
+            normalized_gap.extend([4, 8, 12, 5, 8, 12, 4, 8, 12]);
+        }
+        let pos = 0;
+        let capture_type = 1;
+        let loop_point = 6; // Approximate loop point
+
+        let result = find_loop(&normalized_gap, pos, capture_type, loop_point, false);
+        assert!(result.is_some(), "Loop should be detected");
+        let (start, end, accuracy) = result.unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(end, 9);
+        assert_eq!(accuracy, 10000);
+    }
+
+    #[test]
+    fn test_find_loop_point_fft() {
+        // Create a repeating pattern
+        let pattern = vec![1, 0, 1, 0, 1, 0];
+        let mut bits = pattern.clone();
+        bits.extend(pattern.clone()); // Two revolutions
+        bits.extend(pattern.clone()); // Three revolutions
+
+        let min_expected = 2;
+        let max_expected = 6;
+
+        let result = find_loop_point_fft(&bits, min_expected, max_expected);
+        assert!(result.is_ok());
+        let loop_point = result.unwrap();
+        assert_eq!(loop_point, 6); // Pattern length
+    }
+
+    #[test]
+    fn test_crunch_stream() {
+        let data = vec![1, 0, 0, 1, 0, 1];
+        let step = 1;
+        let result = crunch_stream(&data, step);
+        assert_eq!(result, vec![3, 2, 1]);
+
+        // Test with step > 1
+        let result = crunch_stream(&data, 2);
+        assert_eq!(result, vec![1, 1, 0]);
+    }
+
+    #[test]
+    fn test_crunch_stream_woz() {
+        let data = vec![1, 0, 1, 0, 1, 0];
+        let result = crunch_stream_woz(&data);
+        assert_eq!(result, vec![0b10101000]);
+    }
+
+    #[test]
+    fn test_process_meta() {
+        let data = b"Key1\tValue1\nKey2\tValue2";
+        let result = process_meta(data, 0, data.len() as u32);
+        assert_eq!(result, Ok("Key1\tValue1\nKey2\tValue2".into()));
+    }
+
+    #[test]
+    fn test_capitalize_first_letter() {
+        assert_eq!(capitalize_first_letter("hello"), "Hello");
+        assert_eq!(capitalize_first_letter("hELLO"), "HELLO");
+        assert_eq!(capitalize_first_letter(""), "");
+    }
+
+    #[test]
+    fn test_duplicate_tracks() {
+        let mut map = [0xFF; 160];
+        duplicate_tracks(4, 5, &mut map);
+
+        assert_eq!(map[3], 5); // index - 1
+        assert_eq!(map[5], 5); // index + 1
+        assert_eq!(map[6], 0xff); // index + 2
+        //
+        duplicate_tracks(8, 5, &mut map);
+        assert_eq!(map[7], 5); // index - 1
+        assert_eq!(map[9], 5); // index + 1
+        assert_eq!(map[10], 5); // index + 2
+    }
+
+    #[test]
+    fn test_get_speed() {
+        // Create data with a pattern that should detect bit timing 32
+        let mut data = vec![0; 8000];
+        for i in 0..8000 {
+            if i % 32 == 0 {
+                data[i] = 32;
+            }
+        }
+
+        assert_eq!(get_speed(&data, 0), 32);
+    }
+
+    #[test]
+    fn test_create_progress_bar() {
+        let bar = create_progress_bar(100, false);
+        assert_eq!(bar.length(), Some(100));
+    }
+
+    #[test]
+    fn test_info_display() {
+        let mut info = Info::default();
+        info.version = 2;
+        info.creator = "TestCreator".to_string();
+        info.disk_type = 1;
+        info.write_protected = true;
+        info.synchronized = false;
+
+        let display = format!("{}", info);
+
+        assert!(display.contains("Version"));
+        assert!(display.contains("2 (A2R2)"));
+        assert!(display.contains("5.25-inch (140K)"));
+        assert!(display.contains("Write protected     : true"));
+        assert!(display.contains("Tracks synchronized : false"));
+    }
 }
