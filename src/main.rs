@@ -588,13 +588,9 @@ fn analyze_flux_data(
         }
     } else if args.use_fft {
         let mut data: Vec<_> = decompressed.clone();
-        if data.len() < 2 * (loop_point + LOOP_POINT_DELTA) as usize {
-            let len = data.len() * 3 / 4;
-            for &item in decompressed.iter().take(len) {
-                data.push(item)
-            }
+        for _ in 0..data.len() {
+            data.push(0);
         }
-
         if let Ok(end) = find_loop_point_fft(
             &data,
             (loop_point - LOOP_POINT_DELTA) as usize,
