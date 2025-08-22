@@ -588,9 +588,7 @@ fn analyze_flux_data(
         }
     } else if args.use_fft {
         let mut data: Vec<_> = decompressed.clone();
-        for _ in 0..data.len() {
-            data.push(0);
-        }
+        data.extend(std::iter::repeat_n(0, data.len()));
         if let Ok(end) = find_loop_point_fft(
             &data,
             (loop_point - LOOP_POINT_DELTA) as usize,
@@ -724,21 +722,22 @@ fn find_loop_using_sliding_window(
 
     if !indices.is_empty() && indices.len() < MAX_ALLOWABLE_INDICES {
         for &item in indices.iter() {
-            if item > 0 && index < item as usize {
-                if let Some(accuracy) = compute_accuracy(normalized_gap, index, item as usize) {
-                    let update_best_match = if let Some((_, _, old_accuracy)) = result {
-                        accuracy >= old_accuracy
-                    } else {
-                        true
-                    };
+            if item > 0
+                && index < item as usize
+                && let Some(accuracy) = compute_accuracy(normalized_gap, index, item as usize)
+            {
+                let update_best_match = if let Some((_, _, old_accuracy)) = result {
+                    accuracy >= old_accuracy
+                } else {
+                    true
+                };
 
-                    if update_best_match {
-                        result = Some((index as u32, item, accuracy));
-                    }
+                if update_best_match {
+                    result = Some((index as u32, item, accuracy));
+                }
 
-                    if accuracy == PERFECT_ACCURACY {
-                        return result;
-                    }
+                if accuracy == PERFECT_ACCURACY {
+                    return result;
                 }
             }
         }
