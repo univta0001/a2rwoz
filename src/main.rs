@@ -28,7 +28,7 @@ const WOZ_MAX_TRACKS: usize = 160;
 const WOZ_CREATOR_LEN: usize = 32;
 const WOZ_BLOCK_SIZE: usize = 512;
 
-const LOOP_POINT_DELTA: u32 = 128000;
+const LOOP_POINT_DELTA: u32 = 57000;
 
 /// Maximum allowed mismatch ratio when comparing two tracks
 const MAX_MISMATCH_RATIO: f64 = 0.001; // 0.1 %
@@ -644,7 +644,7 @@ fn find_loop(
     normalized_gap: &[u32],
     pos: u8,
     _capture_type: u8,
-    loop_point: u32,
+    _loop_point: u32,
     kmp: bool,
 ) -> Option<(u32, u32, u32)> {
     const OFFSET_LIMIT: usize = 256;
@@ -658,7 +658,7 @@ fn find_loop(
     }
 
     let cumulative_gap = get_cumulative_gap_array(normalized_gap);
-    let loop_point = (loop_point as u64 * 1020484 / 1000000) as u32;
+    let loop_point = (1600000 as u64 * 1020484 / 1000000) as u32;
     let lower =
         cumulative_gap.partition_point(|&p| p < loop_point.saturating_sub(LOOP_POINT_DELTA));
     let upper = cumulative_gap.partition_point(|&p| p <= loop_point + LOOP_POINT_DELTA);
