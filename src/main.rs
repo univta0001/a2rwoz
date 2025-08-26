@@ -1,18 +1,19 @@
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 use rustfft::{FftPlanner, num_complex::Complex};
 use std::collections::BTreeSet;
 use std::error::Error;
-use std::f32;
 use std::fmt::{Display, Formatter};
-use std::io::IsTerminal;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::str::FromStr;
 use std::string::FromUtf8Error;
+use std::sync::{Arc, Mutex};
 
 type AppError = Box<dyn Error>;
 
+// Constants
 const A2R_A2R1_HEADER: u32 = 0x31523241;
 const A2R_A2R2_HEADER: u32 = 0x32523241;
 const A2R_A2R3_HEADER: u32 = 0x33523241;
@@ -131,6 +132,10 @@ struct Args {
     /// Enable KMP algorithm
     #[arg(long)]
     kmp: bool,
+
+    /// Disable parallel
+    #[arg(long, default_value_t = false)]
+    disable_parallel: bool,
 
     /// Enable debug
     #[arg(long)]
@@ -256,7 +261,7 @@ fn process_info(data: &[u8], offset: usize, info: &mut Info, a2r3: bool) {
         info.version = 2;
     }
     info.creator = str::from_utf8(&data[offset + 1..offset + 33])
-        .unwrap()
+        .unwrap_or("Unknown")
         .into();
     info.disk_type = data[offset + 33];
     info.write_protected = data[offset + 34] == 1;
@@ -307,12 +312,8 @@ where
         args.bit_timing = estimated_bit_timing
     }
 
-    let bar = create_progress_bar((data.len() - *offset) as u64, args.debug);
-    let initial = *offset;
-
+    let mut track_entry = Vec::new();
     while *offset < data.len() {
-        bar.set_position((*offset - initial) as u64);
-
         let current_byte = data[*offset];
         if current_byte == break_condition {
             break;
@@ -321,22 +322,32 @@ where
         let (location, capture_type, length, loop_point, bytes_read) =
             read_data_fn(data, *offset, capture, hard_sector_count);
 
-        let msg = format!("{}", location as f32 / 4.0);
-        bar.set_message(msg);
-
         *offset += bytes_read;
+        track_entry.push((*offset, length, location, capture_type, loop_point));
+        *offset += length as usize;
+    }
 
+    let bar = create_progress_bar(woz_track.len() as u64, args.debug);
+    let mutex_woz_track = Arc::new(Mutex::new(&mut woz_track));
+    let process_item = |item: &(_,_,_,_,_)| {
+    	bar.inc(1);
+        bar.set_message(format!("{}", item.1 as f32 / 4.0));
+        let mut offset = item.0;
         process_flux_data(
-            data,
-            offset,
-            length,
-            &mut woz_track,
-            (location, capture_type, loop_point),
+        	data,
+            &mut offset,
+            item.1,
+            mutex_woz_track.clone(),
+            (item.2, item.3, item.4),
             capture,
             args,
-        );
+        );    	
+    };
+    if args.disable_parallel {
+        track_entry.iter().for_each(process_item);
+    } else {
+        track_entry.par_iter().for_each(process_item);
     }
-    bar.finish_and_clear();
     woz_track
 }
 
@@ -444,19 +455,14 @@ fn process_flux_data(
     data: &[u8],
     offset: &mut usize,
     length: u32,
-    woz_track: &mut [WozTrackEntry],
+    mutex_woz_track: Arc<Mutex<&mut Vec<WozTrackEntry>>>,
     flux_info: (u8, u8, u32),
     capture: &Capture,
-    args: &mut Args,
+    args: &Args,
 ) {
     let location = flux_info.0;
     let capture_type = flux_info.1;
-
-    let tracks: Vec<u8> = if let Some(tracks) = &args.tracks {
-        tracks.to_vec()
-    } else {
-        Vec::new()
-    };
+    let tracks = args.tracks.as_ref().cloned().unwrap_or_default();
 
     if !args.full_tracks && !location.is_multiple_of(4) && !tracks.contains(&location) {
         *offset += length as usize;
@@ -482,38 +488,38 @@ fn process_flux_data(
     }
 
     // If accuracy is 100% and if fast loop is enabled, skip the other same locations
-    if args.fast_loop && woz_track[location as usize].loop_accuracy == 10000 {
-        *offset += length as usize;
-        return;
+    if args.fast_loop {
+        let woz_track = mutex_woz_track.lock().unwrap();
+        if woz_track[location as usize].loop_accuracy == PERFECT_ACCURACY {
+            *offset += length as usize;
+            return;
+        }
     }
 
-    analyze_flux_data(data, woz_track, flux_info, *offset, length, capture, args);
+    analyze_flux_data(
+        data,
+        mutex_woz_track,
+        flux_info,
+        *offset,
+        length,
+        capture,
+        args,
+    );
 
     *offset += length as usize;
 }
 
 fn analyze_flux_data(
     data: &[u8],
-    woz_track: &mut [WozTrackEntry],
+    mutex_woz_track: Arc<Mutex<&mut Vec<WozTrackEntry>>>,
     flux_info: (u8, u8, u32),
     offset: usize,
     length: u32,
     capture: &Capture,
-    args: &mut Args,
+    args: &Args,
 ) {
-    let tracks: Vec<u8> = if let Some(tracks) = &args.tracks {
-        tracks.to_vec()
-    } else {
-        Vec::new()
-    };
-
     let (location, capture_type, loop_point) = flux_info;
-    let label = match capture {
-        Capture::Strm => "STRM",
-        Capture::Data => "DATA",
-        Capture::Rwcp => "RWCP",
-        Capture::Slvd => "SLVD",
-    };
+    let label = get_label(capture);
     let capture_type_str = if capture_type == 1 {
         "timing"
     } else {
@@ -570,6 +576,7 @@ fn analyze_flux_data(
             // 1. Prefer xtiming over timing capture type
             // 2. If it is same capture-type, prefer higher accuracy
             // 3. If accuracy = 100% is encountered, replaced with a newer one
+            let mut woz_track = mutex_woz_track.lock().unwrap();
             let old_woz_track = &woz_track[location as usize];
             if capture_type > old_woz_track.capture_type
                 || (capture_type == old_woz_track.capture_type
@@ -594,13 +601,12 @@ fn analyze_flux_data(
             (loop_point - LOOP_POINT_DELTA) as usize,
             (loop_point + LOOP_POINT_DELTA) as usize,
         ) {
-            let mut loop_flux_data = Vec::new();
-            for &item in data.iter().take(end) {
-                loop_flux_data.push(item);
-            }
+            let loop_flux_data = data.iter().take(end).copied().collect();
+
+            let mut woz_track = mutex_woz_track.lock().unwrap();
             let woz_entry = WozTrackEntry {
                 loop_found: false,
-                flux_data: loop_flux_data.to_vec(),
+                flux_data: loop_flux_data,
                 loop_accuracy: 0,
                 capture_type,
                 original_flux_data: flux_data.to_vec(),
@@ -615,12 +621,15 @@ fn analyze_flux_data(
             location as f32 / 4.0,
             reset_color(true)
         );
+
+        let tracks = args.tracks.as_ref().cloned().unwrap_or_default();
+        let mut woz_track = mutex_woz_track.lock().unwrap();
         if (args.enable_fallback || tracks.contains(&location))
             && !woz_track[location as usize].loop_found
         {
             let woz_entry = WozTrackEntry {
                 loop_found: false,
-                flux_data: (decompressed[0..loop_point as usize]).to_vec(),
+                flux_data: decompressed[0..loop_point as usize].to_vec(),
                 loop_accuracy: 0,
                 capture_type,
                 original_flux_data: flux_data.to_vec(),
@@ -658,30 +667,30 @@ fn find_loop(
     }
 
     let cumulative_gap = get_cumulative_gap_array(normalized_gap);
-    let loop_point = (1600000 as u64 * 1020484 / 1000000) as u32;
+    let loop_point = (1600000_u64 * 1020484 / 1000000) as u32;
     let lower =
         cumulative_gap.partition_point(|&p| p < loop_point.saturating_sub(LOOP_POINT_DELTA));
     let upper = cumulative_gap.partition_point(|&p| p <= loop_point + LOOP_POINT_DELTA);
 
-    let mut result = None;
     for index in 0..OFFSET_LIMIT {
-        if !kmp {
-            result = find_loop_using_sliding_window(index, normalized_gap, lower, upper);
+        let result = if kmp {
+            find_loop_using_kmp_lps(index, normalized_gap, lower, upper)
         } else {
-            result = find_loop_using_kmp_lps(index, normalized_gap, _capture_type);
-        }
+            find_loop_using_sliding_window(index, normalized_gap, lower, upper)
+        };
 
         if result.is_some() {
-            break;
+            return result;
         }
     }
-    result
+    None
 }
 
 fn find_loop_using_kmp_lps(
     index: usize,
     normalized_gap: &[u32],
-    _capture_type: u8,
+    lower: usize,
+    upper: usize,
 ) -> Option<(u32, u32, u32)> {
     let normalized_gap = &normalized_gap[index..];
     let lps = compute_kmp_lps(normalized_gap);
@@ -690,6 +699,10 @@ fn find_loop_using_kmp_lps(
         return None;
     }
     let period = lps.len() - lps_len;
+    
+    if period < lower || period > upper {
+        return None;
+    }   
 
     compute_accuracy(normalized_gap, 0, period)
         .map(|accuracy| (index as u32, (index + period) as u32, accuracy))
@@ -702,47 +715,34 @@ fn find_loop_using_sliding_window(
     upper: usize,
 ) -> Option<(u32, u32, u32)> {
     const SAMPLE_SIZE: usize = 100;
-    const MAX_ALLOWABLE_INDICES: usize = 1000;
 
     if index + SAMPLE_SIZE > normalized_gap.len() {
         return None;
     }
 
     let signature = &normalized_gap[index..index + SAMPLE_SIZE];
-    let indices: Vec<u32> = normalized_gap
-        .windows(SAMPLE_SIZE)
-        .enumerate()
-        .skip(lower)
-        .take_while(|&(i, _)| i < upper)
-        .filter(|&(_, window)| window == signature)
-        .map(|(i, _)| i as u32)
-        .collect();
+    let mut best_match = None;
+    let mut best_accuracy = 0;
 
-    let mut result = None;
+    for pos in lower..upper {
+        if pos + SAMPLE_SIZE > normalized_gap.len() {
+            break;
+        }
 
-    if !indices.is_empty() && indices.len() < MAX_ALLOWABLE_INDICES {
-        for &item in indices.iter() {
-            if item > 0
-                && index < item as usize
-                && let Some(accuracy) = compute_accuracy(normalized_gap, index, item as usize)
-            {
-                let update_best_match = if let Some((_, _, old_accuracy)) = result {
-                    accuracy >= old_accuracy
-                } else {
-                    true
-                };
-
-                if update_best_match {
-                    result = Some((index as u32, item, accuracy));
+        if &normalized_gap[pos..pos + SAMPLE_SIZE] == signature {
+            if let Some(accuracy) = compute_accuracy(normalized_gap, index, pos) {
+                if accuracy == PERFECT_ACCURACY {
+                    return Some((index as u32, pos as u32, accuracy));
                 }
 
-                if accuracy == PERFECT_ACCURACY {
-                    return result;
+                if accuracy >= best_accuracy {
+                    best_accuracy = accuracy;
+                    best_match = Some((index as u32, pos as u32, accuracy));
                 }
             }
         }
     }
-    result
+    best_match
 }
 
 fn compute_accuracy(normalized_gap: &[u32], start: usize, end: usize) -> Option<u32> {
@@ -753,17 +753,16 @@ fn compute_accuracy(normalized_gap: &[u32], start: usize, end: usize) -> Option<
     }
 
     let compare_data = &normalized_gap[end..];
-    let compare_len = compare_data.len().min(segment.len()) as u32;
+    let compare_len = compare_data.len().min(segment.len());
     if compare_len == 0 {
         return None;
     }
-    let mut accuracy = segment
+    let matches = segment[..compare_len]
         .iter()
-        .zip(compare_data.iter())
+        .zip(compare_data[0..compare_len].iter())
         .filter(|&(a, b)| a == b)
         .count() as u32;
-    accuracy = accuracy * ACCURACY_MULTIPLIER / compare_len;
-    Some(accuracy)
+    Some((matches * ACCURACY_MULTIPLIER) / compare_len as u32)
 }
 
 fn decrunch_stream(flux_record: &[u8]) -> Vec<u8> {
@@ -1026,6 +1025,13 @@ fn main() -> Result<(), AppError> {
     let now = std::time::Instant::now();
     let dsk = std::fs::read(&args.input)?;
 
+    if dsk.len() < 8 {
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Invalid A2R file",
+        )));
+    }
+
     // Check for WOZ format
     let header = read_a2r_u32(&dsk, 0);
 
@@ -1093,14 +1099,14 @@ fn main() -> Result<(), AppError> {
                 A2R_DATA_CHUNK if a2r1 => {
                     let mut woz_tracks =
                         process_strm_data(&dsk, &mut dsk_offset, Capture::Data, &mut args);
-                    create_woz_file(&mut woz_tracks, &info, &mut args)?;
+                    create_woz_file(&mut woz_tracks, &info, &args)?;
                 }
 
                 // STRM
                 A2R_STRM_CHUNK if info_detected => {
                     let mut woz_tracks =
                         process_strm_data(&dsk, &mut dsk_offset, Capture::Strm, &mut args);
-                    create_woz_file(&mut woz_tracks, &info, &mut args)?;
+                    create_woz_file(&mut woz_tracks, &info, &args)?;
                 }
 
                 // RWCP
@@ -1112,7 +1118,7 @@ fn main() -> Result<(), AppError> {
                         info.hard_sector_count,
                         true,
                     );
-                    create_woz_file(&mut woz_tracks, &info, &mut args)?;
+                    create_woz_file(&mut woz_tracks, &info, &args)?;
                 }
 
                 // SLVD
@@ -1124,7 +1130,7 @@ fn main() -> Result<(), AppError> {
                         info.hard_sector_count,
                         false,
                     );
-                    create_woz_file(&mut woz_tracks, &info, &mut args)?;
+                    create_woz_file(&mut woz_tracks, &info, &args)?;
                 }
 
                 _ => dsk_offset += chunk_size as usize,
@@ -1142,7 +1148,7 @@ fn main() -> Result<(), AppError> {
 }
 
 fn process_meta(dsk: &[u8], offset: usize, chunk_size: u32) -> Result<String, FromUtf8Error> {
-    String::from_utf8((dsk[offset..offset + chunk_size as usize]).to_vec())
+    String::from_utf8(dsk[offset..offset + chunk_size as usize].to_vec())
 }
 
 fn print_meta_information(meta: &str, metainfo: bool) {
@@ -1173,7 +1179,7 @@ fn capitalize_first_letter(s: &str) -> String {
 fn create_woz_file(
     woz_tracks: &mut [WozTrackEntry],
     woz_info: &Info,
-    args: &mut Args,
+    args: &Args,
 ) -> std::io::Result<()> {
     fn make_chunk(chunk_id: &str, data: &[u8]) -> Vec<u8> {
         let mut v = Vec::new();
@@ -1185,7 +1191,7 @@ fn create_woz_file(
 
     if args.show_unsolved_tracks {
         for (i, item) in woz_tracks.iter().enumerate().take(WOZ_MAX_TRACKS) {
-            if !woz_tracks[i].flux_data.is_empty() && woz_tracks[i].loop_accuracy != 10000 {
+            if !woz_tracks[i].flux_data.is_empty() && woz_tracks[i].loop_accuracy != PERFECT_ACCURACY {
                 println!(
                     "{}LOOP{}: Track {:5} ({:3})   : {}% accurate",
                     green_color(false),
@@ -1233,8 +1239,7 @@ fn create_woz_file(
     let bar = create_progress_bar(WOZ_MAX_TRACKS as u64, args.debug);
     for i in 0..WOZ_MAX_TRACKS {
         bar.inc(1);
-        let msg = format!("{}", i as f32 / 4.0);
-        bar.set_message(msg);
+        bar.set_message(format!("{}", i as f32 / 4.0));
 
         if ignore_tracks.contains(&i) {
             continue;
@@ -1284,7 +1289,6 @@ fn create_woz_file(
             flux_enabled = true;
         }
     }
-    bar.finish_and_clear();
 
     if let Some(flux) = &args.flux {
         flux_enabled = true;
@@ -1754,7 +1758,7 @@ mod tests {
         let (start, end, accuracy) = result.unwrap();
         assert_eq!(start, 0);
         assert_eq!(end, 9);
-        assert_eq!(accuracy, 10000);
+        assert_eq!(accuracy, PERFECT_ACCURACY);
     }
 
     #[test]
