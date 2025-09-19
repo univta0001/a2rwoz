@@ -29,7 +29,7 @@ const WOZ_MAX_TRACKS: usize = 160;
 const WOZ_CREATOR_LEN: usize = 32;
 const WOZ_BLOCK_SIZE: usize = 512;
 
-const LOOP_POINT_DELTA: u32 = 57000;
+const LOOP_POINT_DELTA: u32 = 160000;
 
 /// Maximum allowed mismatch ratio when comparing two tracks
 const MAX_MISMATCH_RATIO: f64 = 0.001; // 0.1 %
@@ -329,19 +329,19 @@ where
 
     let bar = create_progress_bar(woz_track.len() as u64, args.debug);
     let mutex_woz_track = Arc::new(Mutex::new(&mut woz_track));
-    let process_item = |item: &(_,_,_,_,_)| {
-    	bar.inc(1);
+    let process_item = |item: &(_, _, _, _, _)| {
+        bar.inc(1);
         bar.set_message(format!("{}", item.1 as f32 / 4.0));
         let mut offset = item.0;
         process_flux_data(
-        	data,
+            data,
             &mut offset,
             item.1,
             mutex_woz_track.clone(),
             (item.2, item.3, item.4),
             capture,
             args,
-        );    	
+        );
     };
     if args.disable_parallel {
         track_entry.iter().for_each(process_item);
@@ -552,6 +552,7 @@ fn analyze_flux_data(
     //let decompressed = decrunch_stream_flux(&normalized_gap);
 
     if let Some((start, end, accuracy)) = find_loop(
+        &cumulative_gap,
         &normalized_gap,
         location,
         capture_type,
@@ -650,6 +651,7 @@ fn analyze_flux_data(
 }
 
 fn find_loop(
+    cumulative_gap: &[u32],
     normalized_gap: &[u32],
     pos: u8,
     _capture_type: u8,
@@ -666,7 +668,6 @@ fn find_loop(
         return None;
     }
 
-    let cumulative_gap = get_cumulative_gap_array(normalized_gap);
     let loop_point = (1600000_u64 * 1020484 / 1000000) as u32;
     let lower =
         cumulative_gap.partition_point(|&p| p < loop_point.saturating_sub(LOOP_POINT_DELTA));
@@ -699,10 +700,10 @@ fn find_loop_using_kmp_lps(
         return None;
     }
     let period = lps.len() - lps_len;
-    
+
     if period < lower || period > upper {
         return None;
-    }   
+    }
 
     compute_accuracy(normalized_gap, 0, period)
         .map(|accuracy| (index as u32, (index + period) as u32, accuracy))
@@ -729,16 +730,16 @@ fn find_loop_using_sliding_window(
             break;
         }
 
-        if &normalized_gap[pos..pos + SAMPLE_SIZE] == signature {
-            if let Some(accuracy) = compute_accuracy(normalized_gap, index, pos) {
-                if accuracy == PERFECT_ACCURACY {
-                    return Some((index as u32, pos as u32, accuracy));
-                }
+        if &normalized_gap[pos..pos + SAMPLE_SIZE] == signature
+            && let Some(accuracy) = compute_accuracy(normalized_gap, index, pos)
+        {
+            if accuracy == PERFECT_ACCURACY {
+                return Some((index as u32, pos as u32, accuracy));
+            }
 
-                if accuracy >= best_accuracy {
-                    best_accuracy = accuracy;
-                    best_match = Some((index as u32, pos as u32, accuracy));
-                }
+            if accuracy >= best_accuracy {
+                best_accuracy = accuracy;
+                best_match = Some((index as u32, pos as u32, accuracy));
             }
         }
     }
@@ -1191,7 +1192,9 @@ fn create_woz_file(
 
     if args.show_unsolved_tracks {
         for (i, item) in woz_tracks.iter().enumerate().take(WOZ_MAX_TRACKS) {
-            if !woz_tracks[i].flux_data.is_empty() && woz_tracks[i].loop_accuracy != PERFECT_ACCURACY {
+            if !woz_tracks[i].flux_data.is_empty()
+                && woz_tracks[i].loop_accuracy != PERFECT_ACCURACY
+            {
                 println!(
                     "{}LOOP{}: Track {:5} ({:3})   : {}% accurate",
                     green_color(false),
