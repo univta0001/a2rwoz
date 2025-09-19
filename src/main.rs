@@ -551,12 +551,12 @@ fn analyze_flux_data(
 
     //let decompressed = decrunch_stream_flux(&normalized_gap);
 
+    let estimated_loop_point = (1600000_u64 * 1020484 / 1000000) as u32;
     if let Some((start, end, accuracy)) = find_loop(
-        &cumulative_gap,
         &normalized_gap,
         location,
         capture_type,
-        loop_point,
+        estimated_loop_point,
         args.kmp,
     ) {
         if start < end && start < cumulative_gap.len() as u32 && end < cumulative_gap.len() as u32 {
@@ -651,11 +651,10 @@ fn analyze_flux_data(
 }
 
 fn find_loop(
-    cumulative_gap: &[u32],
     normalized_gap: &[u32],
     pos: u8,
     _capture_type: u8,
-    _loop_point: u32,
+    loop_point: u32,
     kmp: bool,
 ) -> Option<(u32, u32, u32)> {
     const OFFSET_LIMIT: usize = 256;
@@ -668,7 +667,7 @@ fn find_loop(
         return None;
     }
 
-    let loop_point = (1600000_u64 * 1020484 / 1000000) as u32;
+    let cumulative_gap = get_cumulative_gap_array(normalized_gap);
     let lower =
         cumulative_gap.partition_point(|&p| p < loop_point.saturating_sub(LOOP_POINT_DELTA));
     let upper = cumulative_gap.partition_point(|&p| p <= loop_point + LOOP_POINT_DELTA);
