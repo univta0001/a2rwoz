@@ -1070,6 +1070,7 @@ fn main() -> Result<(), AppError> {
                         info_detected = true;
                     }
                 } else {
+                    info.disk_type = 1;
                     print!("{info}");
                     let metadata = process_meta(&dsk, dsk_offset, chunk_size)?;
                     print_meta_information(&metadata, false);
