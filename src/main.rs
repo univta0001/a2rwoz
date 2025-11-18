@@ -724,21 +724,27 @@ fn find_loop_using_sliding_window(
     let mut best_match = None;
     let mut best_accuracy = 0;
 
-    for pos in lower..upper {
-        if pos + SAMPLE_SIZE > normalized_gap.len() {
-            break;
-        }
+    let midpoint = (lower + upper) / 2;
+    let search_margin = std::cmp::min(midpoint - lower, upper - midpoint);
 
-        if &normalized_gap[pos..pos + SAMPLE_SIZE] == signature
-            && let Some(accuracy) = compute_accuracy(normalized_gap, index, pos)
-        {
-            if accuracy == PERFECT_ACCURACY {
-                return Some((index as u32, pos as u32, accuracy));
+    for margin in 0..search_margin {
+        let search = [midpoint - margin, midpoint + margin];
+        for &pos in &search {
+            if pos + SAMPLE_SIZE > normalized_gap.len() {
+                continue;
             }
 
-            if accuracy >= best_accuracy {
-                best_accuracy = accuracy;
-                best_match = Some((index as u32, pos as u32, accuracy));
+            if &normalized_gap[pos..pos + SAMPLE_SIZE] == signature
+                && let Some(accuracy) = compute_accuracy(normalized_gap, index, pos)
+            {
+                if accuracy == PERFECT_ACCURACY {
+                    return Some((index as u32, pos as u32, accuracy));
+                }
+
+                if accuracy >= best_accuracy {
+                    best_accuracy = accuracy;
+                    best_match = Some((index as u32, pos as u32, accuracy));
+                }
             }
         }
     }
