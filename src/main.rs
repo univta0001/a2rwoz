@@ -327,7 +327,7 @@ where
         *offset += length as usize;
     }
 
-    let bar = create_progress_bar(woz_track.len() as u64, args.debug);
+    let bar = create_progress_bar(track_entry.len() as u64, args.debug);
     let mutex_woz_track = Arc::new(Mutex::new(&mut woz_track));
     let process_item = |item: &(_, _, _, _, _)| {
         bar.inc(1);
@@ -716,7 +716,7 @@ fn find_loop_using_sliding_window(
 ) -> Option<(u32, u32, u32)> {
     const SAMPLE_SIZE: usize = 100;
 
-    if index + SAMPLE_SIZE > normalized_gap.len() {
+    if index + SAMPLE_SIZE > normalized_gap.len() || lower >= upper {
         return None;
     }
 
