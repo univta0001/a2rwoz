@@ -331,7 +331,7 @@ where
     let mutex_woz_track = Arc::new(Mutex::new(&mut woz_track));
     let process_item = |item: &(_, _, _, _, _)| {
         bar.inc(1);
-        bar.set_message(format!("{}", item.1 as f32 / 4.0));
+        bar.set_message(format!("{}", item.2 as f32 / 4.0));
         let mut offset = item.0;
         process_flux_data(
             data,
