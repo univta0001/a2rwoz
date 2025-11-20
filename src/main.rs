@@ -32,7 +32,7 @@ const WOZ_BLOCK_SIZE: usize = 512;
 const LOOP_POINT_DELTA: u32 = 160000;
 
 /// Maximum allowed mismatch ratio when comparing two tracks
-const ALIGNMENT_LEN: usize = 1024;
+const COMPARE_CHECK_LEN: usize = 1024;
 const ACCURACY_MULTIPLIER: u32 = 10000;
 const PERFECT_ACCURACY: u32 = 10000;
 
@@ -901,9 +901,9 @@ fn normalized_track(track: &[u8], bit_timing: u8) -> Vec<u8> {
 }
 
 fn compare_track(track: &[u8], prev_track: &[u8], bit_timing: u8) -> bool {
-    let compare_len = track.len().min(prev_track.len()).min(ALIGNMENT_LEN);
-    let track = &normalized_track(&track[0..compare_len], bit_timing);
-    let prev_track = &normalized_track(&prev_track[0..compare_len], bit_timing);
+    let compare_len = track.len().min(prev_track.len()).min(COMPARE_CHECK_LEN);
+    let track = &normalized_track(&track, bit_timing)[0..compare_len];
+    let prev_track = &normalized_track(&prev_track, bit_timing)[0..compare_len];
     /*
     let mut best_mismatch = u32::MAX;
     let iter_count = std::cmp::min(16, track.len());
@@ -919,17 +919,9 @@ fn compare_track(track: &[u8], prev_track: &[u8], bit_timing: u8) -> bool {
             }
         }
     }
-
     (best_mismatch as f64 / compare_len as f64) < MAX_MISMATCH_RATIO
     */
-    let score = get_sequence_alignment_score(
-        &track[0..ALIGNMENT_LEN],
-        &prev_track[0..ALIGNMENT_LEN],
-        1,
-        -1,
-        -2,
-    );
-    score > (ALIGNMENT_LEN as isize * 90 / 100)
+    get_edit_distance_score(&track, &prev_track) < COMPARE_CHECK_LEN / 20
 }
 
 fn _cross_correlation_sameness_ratio_fft(arr1: &[u8], arr2: &[u8]) -> f64 {
@@ -1013,45 +1005,38 @@ fn _cross_correlation_sameness_ratio_fft(arr1: &[u8], arr2: &[u8]) -> f64 {
     max_cross_corr_value / (norm_arr1 * norm_arr2)
 }
 
-fn get_sequence_alignment_score(
-    s1: &[u8],
-    s2: &[u8],
-    match_score: isize,
-    mismatch_score: isize,
-    gap_penalty: isize,
-) -> isize {
-    // Implements Needleman Wunsch algorithm and return the score
-
+fn get_edit_distance_score(s1: &[u8], s2: &[u8]) -> usize {
     let n = s1.len();
     let m = s2.len();
 
-    // Initialize the scoring matrix
-    let mut matrix = vec![vec![0; m + 1]; n + 1];
-
-    // Fill the first row and column with gap penalties
-    for i in 0..=n {
-        matrix[i][0] = i as isize * gap_penalty;
+    // Ensure s2 is the shorter string to minimize space usage
+    if m > n {
+        return get_edit_distance_score(s2, s1);
     }
+
+    // Only need two rows: current and previous
+    let mut row = vec![0; m + 1];
+
+    // Initialize first row
     for j in 0..=m {
-        matrix[0][j] = j as isize * gap_penalty;
+        row[j] = j;
     }
 
-    // Fill the matrix using the recurrence relation
     for i in 1..=n {
+        let mut prev_diag = row[0];
+        row[0] = i;
+
         for j in 1..=m {
-            let score_diag = matrix[i - 1][j - 1]
-                + if s1[i - 1] == s2[j - 1] {
-                    match_score
-                } else {
-                    mismatch_score
-                };
-            let score_up = matrix[i - 1][j] + gap_penalty;
-            let score_left = matrix[i][j - 1] + gap_penalty;
-            matrix[i][j] = score_diag.max(score_up).max(score_left);
+            let temp = row[j];
+            let score_diag = prev_diag + if s1[i - 1] == s2[j - 1] { 0 } else { 1 };
+            let score_up = temp + 1;
+            let score_left = row[j - 1] + 1;
+            row[j] = score_diag.min(score_up).min(score_left);
+            prev_diag = temp;
         }
     }
 
-    matrix[n][m]
+    row[m]
 }
 
 fn get_speed(data: &[u8], offset: usize) -> u8 {
