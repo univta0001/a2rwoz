@@ -141,6 +141,10 @@ struct Args {
     #[arg(long)]
     debug: bool,
 
+    /// Enable debug
+    #[arg(long)]
+    disable_progressbar: bool,
+
     #[arg(long, hide = true, default_value_t = 125000)]
     resolution: u32,
 
@@ -327,7 +331,11 @@ where
         *offset += length as usize;
     }
 
-    let bar = create_progress_bar(track_entry.len() as u64, args.debug);
+    let bar = create_progress_bar(
+        track_entry.len() as u64,
+        args.debug,
+        args.disable_progressbar,
+    );
     let mutex_woz_track = Arc::new(Mutex::new(&mut woz_track));
     let process_item = |item: &(_, _, _, _, _)| {
         bar.inc(1);
@@ -406,16 +414,20 @@ fn process_rwcp_slvd(
     let data_offset = 9 + 4 * data[*offset + 4] as usize;
     let read_data_fn =
         |data: &[u8], current_offset: usize, _capture: &Capture, hard_sector_count: Option<u8>| {
-            let capture_type = data[current_offset + 1];
-            let location =
+            let mut capture_type = data[current_offset + 1];
+            let mut location =
                 (data[current_offset + 2] as usize + data[current_offset + 3] as usize * 256) as u8;
-            let index_signals_size = data[current_offset + 4] as usize;
+            let mut index_signals_size = data[current_offset + 4] as usize;
 
             let mut bytes_read = 5;
 
             // Skip Mirror Distance Outward and Mirror Distance Inward for SLVD
             if !rwcp {
-                bytes_read += 7;
+                capture_type = 0;
+                location = (data[current_offset + 1] as usize
+                    + data[current_offset + 2] as usize * 256) as u8;
+                index_signals_size = data[current_offset + 11] as usize;
+                bytes_read = 12;
             }
 
             let mut index_signals = vec![0_usize; index_signals_size];
@@ -657,7 +669,7 @@ fn find_loop(
     loop_point: u32,
     kmp: bool,
 ) -> Option<(u32, u32, u32)> {
-    const OFFSET_LIMIT: usize = 256;
+    const OFFSET_LIMIT: usize = 1000;
 
     if pos >= WOZ_MAX_TRACKS as u8 {
         return None;
@@ -714,7 +726,7 @@ fn find_loop_using_sliding_window(
     lower: usize,
     upper: usize,
 ) -> Option<(u32, u32, u32)> {
-    const SAMPLE_SIZE: usize = 100;
+    const SAMPLE_SIZE: usize = 512;
 
     if index + SAMPLE_SIZE > normalized_gap.len() || lower >= upper {
         return None;
@@ -1281,7 +1293,7 @@ fn create_woz_file(
         .map(|delete_tracks| delete_tracks.iter().map(|&item| item as usize).collect())
         .unwrap_or_default();
 
-    let bar = create_progress_bar(WOZ_MAX_TRACKS as u64, args.debug);
+    let bar = create_progress_bar(WOZ_MAX_TRACKS as u64, args.debug, args.disable_progressbar);
     for i in 0..WOZ_MAX_TRACKS {
         bar.inc(1);
         bar.set_message(format!("{}", i as f32 / 4.0));
@@ -1490,8 +1502,8 @@ fn crc32(value: u32, buf: &[u8]) -> u32 {
     crc ^ 0xffffffff
 }
 
-fn create_progress_bar(size: u64, debug: bool) -> ProgressBar {
-    let bar = if debug {
+fn create_progress_bar(size: u64, debug: bool, disable_progressbar: bool) -> ProgressBar {
+    let bar = if debug || disable_progressbar {
         ProgressBar::hidden()
     } else {
         ProgressBar::new(size)
@@ -1886,7 +1898,7 @@ mod tests {
 
     #[test]
     fn test_create_progress_bar() {
-        let bar = create_progress_bar(100, false);
+        let bar = create_progress_bar(100, false, false);
         assert_eq!(bar.length(), Some(100));
     }
 
